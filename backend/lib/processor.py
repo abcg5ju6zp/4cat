@@ -221,7 +221,10 @@ class BasicProcessor(FourcatModule, BasicWorker, metaclass=abc.ABCMeta):
             try:
                 self.process()
                 self.after_process()
-                
+                # release the durable delegation batch, if any, so it does not
+                # wait for expiry after a successful run
+                self.complete_proxied_requests()
+
                 # processors should usually finish their jobs by themselves, but if
                 # the worker finished without errors, the job can be finished in
                 # any case
@@ -419,10 +422,23 @@ class BasicProcessor(FourcatModule, BasicWorker, metaclass=abc.ABCMeta):
                 except (SMTPException, ConnectionRefusedError, socket.timeout):
                     self.log.error("Error sending email to %s" % owner)
 
-    def clean_up_on_error(self):
+    def clean_up_on_error(self, detach_proxied=True):
+        """
+        Clean up after the processor errored or was interrupted
+
+        :param bool detach_proxied:  When True (retries/crashes), the durable
+        delegation batch is detached rather than cancelled, so a later attempt
+        of this job only retries requests without a confirmable result and
+        skips requests that were already delivered. When False
+        (cancellation), remaining requests are stopped as with
+        `flush_proxied_requests()`.
+        """
         try:
-            # ensure proxied requests are stopped
-            self.flush_proxied_requests()
+            # ensure proxied requests are stopped or released for takeover
+            if detach_proxied:
+                self.detach_proxied_requests()
+            else:
+                self.flush_proxied_requests()
             # delete annotations that have been generated as part of this processor
             self.db.delete("annotations", where={"from_dataset": self.dataset.key}, commit=True)
             # Remove the results file that was created
@@ -438,7 +454,9 @@ class BasicProcessor(FourcatModule, BasicWorker, metaclass=abc.ABCMeta):
         """
         Abort dataset creation and clean up so it may be attempted again later
         """
-        self.clean_up_on_error()
+        # a retried job takes over its still-useful delegated requests, a
+        # cancelled job stops them
+        self.clean_up_on_error(detach_proxied=self.interrupted != self.INTERRUPT_CANCEL)
 
         # we release instead of finish, since interrupting is just that - the
         # job should resume at a later point. Delay resuming by 10 seconds to
@@ -475,6 +493,7 @@ class BasicProcessor(FourcatModule, BasicWorker, metaclass=abc.ABCMeta):
         delegator = self.manager.proxy_delegator
 
         delegator.refresh_settings(self.config)
+        self._bind_proxy_queue(queue_name, delegator)
 
         # 50 is an arbitrary batch size - but we top up every 0.05s, so
         # that should be sufficient
@@ -518,21 +537,101 @@ class BasicProcessor(FourcatModule, BasicWorker, metaclass=abc.ABCMeta):
         Get rid of remaining proxied requests
 
         Can be used if enough results are available and any remaining ones need
-        to be stopped ASAP and are otherwise unneeded.
+        to be stopped ASAP and are otherwise unneeded. This cancels the
+        delegation batch: unclaimed requests are stopped and undelivered
+        results are discarded.
 
         Blocking!
         """
         self.manager.proxy_delegator.halt_and_wait(self._proxy_queue_name())
 
+    def detach_proxied_requests(self):
+        """
+        Release the delegation batch for takeover by a later job attempt
+
+        Unclaimed requests stay queued, in-flight attempts are recorded as
+        abandoned, and finished-but-undelivered results are kept for the
+        takeover to deliver. Requests already delivered are skipped on resume.
+        """
+        try:
+            self.manager.proxy_delegator.detach_batch(self._proxy_queue_name())
+        except Exception as e:
+            self.log.debug(f"Could not detach delegated request batch: {e}")
+
+    def complete_proxied_requests(self):
+        """
+        Mark the delegation batch, if any, as normally completed
+        """
+        try:
+            self.manager.proxy_delegator.complete_batch(self._proxy_queue_name())
+        except Exception as e:
+            self.log.debug(f"Could not complete delegated request batch: {e}")
+
+    def _bind_proxy_queue(self, queue_name, delegator):
+        """
+        Bind this processor's queue to its durable delegation batch
+
+        Takes over an existing batch when the job is being retried after a
+        restart. When another live backend holds the batch, the job is released
+        for retry instead of fighting for ownership.
+        """
+        from backend.lib.proxied_requests import DelegatedRequestConflict
+
+        try:
+            delegator.bind_batch(
+                queue_name,
+                processor_type=self.type,
+                dataset_key=self.dataset.key if self.dataset else "",
+                job_id=self.job.data.get("id") if self.job else None,
+                hook_binder=self._bind_delegator_hook,
+            )
+        except DelegatedRequestConflict as e:
+            self.log.warning(f"Cannot take over delegated request batch for {self.type}/{self.dataset.key}: {e}")
+            if self.dataset:
+                self.dataset.update_status("Delegated requests are handled by another backend, retrying later.",
+                                           status_type=StatusType.QUEUED)
+            # make sure abort() releases the job for a later retry instead of
+            # finishing it
+            self.interrupted = self.INTERRUPT_RETRY
+            raise WorkerInterruptedException(str(e))
+
+    def _bind_delegator_hook(self, ref):
+        """
+        Re-attach a persisted response hook reference to this processor
+
+        Hooks persisted as bound methods are re-bound to this processor
+        instance; references belonging to a different class are not resolved
+        here (they may still be importable module-level hooks).
+        """
+        if not isinstance(ref, dict) or ref.get("bind") != "processor":
+            return None
+
+        class_name, _, method_name = (ref.get("qualname") or "").rpartition(".")
+        if not method_name:
+            return None
+        if class_name not in (type(self).__qualname__, type(self).__name__):
+            return None
+
+        candidate = getattr(self, method_name, None)
+        return candidate if callable(candidate) else None
+
     def _proxy_queue_name(self):
         """
         Get proxy queue name
+
+        The name is the stable identity of this processor job's delegation
+        batch: retries of the same job reuse the batch, while a freshly queued
+        job (with a new job id) starts a new batch.
 
         For internal use.
 
         :return str:
         """
-        return f"{self.type}-{self.dataset.key}"
+        job_id = self.job.data.get("id") if self.job else None
+        dataset_key = self.dataset.key if self.dataset else ""
+        if job_id is not None:
+            return f"{self.type}-{dataset_key}-job{job_id}"
+        return f"{self.type}-{dataset_key}"
 
     def unpack_archive_contents(self, path, staging_area=None):
         """

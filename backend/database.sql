@@ -190,6 +190,79 @@ CREATE UNIQUE INDEX IF NOT EXISTS users_notifications_unique
     canonical_id, username, notification
   );
 
+-- durable state for request batches delegated to the proxy pool
+-- one row per processor-owned delegation batch (key includes the job id)
+CREATE TABLE IF NOT EXISTS delegated_batches (
+  key               TEXT PRIMARY KEY,
+  processor_type    TEXT NOT NULL DEFAULT '',
+  dataset_key       TEXT NOT NULL DEFAULT '',
+  job_id            BIGINT DEFAULT NULL,
+  status            TEXT NOT NULL DEFAULT 'active',
+  owner_id          TEXT DEFAULT NULL,
+  owner_generation  INTEGER NOT NULL DEFAULT 0,
+  lease_expires     DOUBLE PRECISION NOT NULL DEFAULT 0,
+  next_seq          DOUBLE PRECISION NOT NULL DEFAULT 0,
+  expires_at        DOUBLE PRECISION NOT NULL DEFAULT 0,
+  created_at        DOUBLE PRECISION NOT NULL,
+  updated_at        DOUBLE PRECISION NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS delegated_batches_status
+  ON delegated_batches (
+    status, expires_at
+  );
+
+-- one row per request in a delegation batch; seq preserves input order
+CREATE TABLE IF NOT EXISTS delegated_requests (
+  id                BIGSERIAL PRIMARY KEY,
+  batch_key         TEXT NOT NULL REFERENCES delegated_batches (key) ON DELETE CASCADE,
+  seq               DOUBLE PRECISION NOT NULL,
+  url               TEXT NOT NULL,
+  kwargs            JSONB NOT NULL DEFAULT '{}'::jsonb,
+  status            TEXT NOT NULL DEFAULT 'queued',
+  claimer           TEXT DEFAULT NULL,
+  attempt_no        INTEGER NOT NULL DEFAULT 0,
+  lease_expires     DOUBLE PRECISION NOT NULL DEFAULT 0,
+  result_kind       TEXT DEFAULT NULL,
+  response_summary  JSONB NOT NULL DEFAULT '{}'::jsonb,
+  delivered         BOOLEAN NOT NULL DEFAULT FALSE,
+  delivered_at      DOUBLE PRECISION NOT NULL DEFAULT 0,
+  created_at        DOUBLE PRECISION NOT NULL,
+  updated_at        DOUBLE PRECISION NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS delegated_requests_batch_seq
+  ON delegated_requests (
+    batch_key, seq
+  );
+
+CREATE INDEX IF NOT EXISTS delegated_requests_delivery
+  ON delegated_requests (
+    batch_key, delivered, seq
+  );
+
+CREATE INDEX IF NOT EXISTS delegated_requests_claim
+  ON delegated_requests (
+    status, lease_expires
+  );
+
+-- history of external attempts made for a request (one row per attempt)
+CREATE TABLE IF NOT EXISTS delegated_attempts (
+  id                BIGSERIAL PRIMARY KEY,
+  request_id        BIGINT NOT NULL REFERENCES delegated_requests (id) ON DELETE CASCADE,
+  attempt_no        INTEGER NOT NULL,
+  proxy             TEXT DEFAULT NULL,
+  outcome           TEXT NOT NULL,
+  summary           JSONB NOT NULL DEFAULT '{}'::jsonb,
+  started_at        DOUBLE PRECISION NOT NULL,
+  finished_at       DOUBLE PRECISION NOT NULL DEFAULT 0
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS delegated_attempts_request_attempt
+  ON delegated_attempts (
+    request_id, attempt_no
+  );
+
 -- used to quickly update table counts
 CREATE FUNCTION count_estimate(query text) RETURNS bigint AS $$
   DECLARE

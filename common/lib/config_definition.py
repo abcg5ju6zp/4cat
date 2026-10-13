@@ -331,6 +331,52 @@ config_definition = {
         "help": "Proxy health check timeout",
         "tooltip": "Timeout in seconds for the proxy health check request."
     },
+    "proxies.durable-delegation": {
+        "type": UserInput.OPTION_TOGGLE,
+        "default": True,
+        "help": "Persist delegated request batches",
+        "tooltip": "If enabled, processor-owned batches of proxied requests are recorded in the database with their "
+                   "input order, attempts, results and delivery status. After a backend restart or worker reassignment, "
+                   "requests without a confirmable result are retried, already delivered requests are skipped, and "
+                   "results are never delivered twice. Disable to keep batches in process memory only."
+    },
+    "proxies.owner-lease": {
+        "type": UserInput.OPTION_TEXT,
+        "coerce_type": int,
+        "default": 300,
+        "min": 30,
+        "help": "Delegation owner lease (seconds)",
+        "tooltip": "For how long a backend owns a delegated batch without a heartbeat. When the lease expires while "
+                   "the owning backend is down, another backend can take the batch over."
+    },
+    "proxies.request-lease": {
+        "type": UserInput.OPTION_TEXT,
+        "coerce_type": int,
+        "default": 300,
+        "min": 30,
+        "help": "Delegated request lease (seconds)",
+        "tooltip": "For how long a started request is considered in flight before its attempt is treated as "
+                   "abandoned and retried (on another proxy where possible). Should exceed the longest configured "
+                   "request timeout."
+    },
+    "proxies.batch-expiry": {
+        "type": UserInput.OPTION_TEXT,
+        "coerce_type": int,
+        "default": 604800,
+        "min": 3600,
+        "help": "Delegated batch expiry (seconds)",
+        "tooltip": "An active batch with no activity for this long expires: unclaimed requests are stopped, running "
+                   "attempts are marked as expired and late responses are ignored. Defaults to one week."
+    },
+    "proxies.record-retention": {
+        "type": UserInput.OPTION_TEXT,
+        "coerce_type": int,
+        "default": 2592000,
+        "min": 3600,
+        "help": "Delegation record retention (seconds)",
+        "tooltip": "How long finished, cancelled or expired delegation batches (with their requests and attempts) "
+                   "are kept in the database before being deleted. Defaults to 30 days."
+    },
     # logging
     "logging.slack.level": {
         "type": UserInput.OPTION_CHOICE,

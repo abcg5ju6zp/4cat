@@ -45,8 +45,9 @@ class WorkerManager:
 		self.db = database
 		self.log = logger
 		self.modules = modules
+		# the delegator opens its own database connection when persistence is
+		# enabled, since worker threads must not share the manager's connection
 		self.proxy_delegator = DelegatedRequestHandler(self.log, self.modules.config)
-
 		if as_daemon:
 			signal.signal(signal.SIGTERM, self.abort)
 
@@ -90,6 +91,13 @@ class WorkerManager:
 		slots are available for those workers.
 		"""
 		jobs = self.queue.get_all_jobs()
+
+		# renew delegation leases and expire stale batches; this runs in the
+		# manager thread so a blocked worker thread cannot let leases lapse
+		try:
+			self.proxy_delegator.heartbeat()
+		except Exception as e:
+			self.log.debug(f"Delegation heartbeat failed: {e}")
 
 		num_active = len(list(self.iterate_active_workers()))
 		self.log.debug2(f"Running {num_active} active workers")
