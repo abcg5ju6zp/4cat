@@ -536,6 +536,8 @@ class User:
         self.db.delete("users_favourites", where={"name": username}, commit=False),
         self.db.delete("users_notifications", where={"username": username}, commit=False)
         self.db.delete("access_tokens", where={"name": username}, commit=False)
+        # scoped token generations are removed by the ON DELETE CASCADE foreign key
+        self.db.delete("access_token_series", where={"name": username}, commit=False)
 
         # find datasets and delete
         datasets = self.db.fetchall("SELECT key FROM datasets_owners WHERE name = %s", (username,))

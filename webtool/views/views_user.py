@@ -7,14 +7,19 @@ import smtplib
 import fnmatch
 import socket
 import random
+import re
 import time
+import uuid
 
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-from flask import current_app, Blueprint, request, abort, render_template, redirect, url_for, flash, get_flashed_messages, jsonify, g
+from flask import current_app, Blueprint, request, abort, render_template, redirect, url_for, flash, get_flashed_messages, jsonify, g, make_response
 from flask_login import login_user, login_required, logout_user, current_user
 from common.lib.user import User
+from common.lib.dataset import DataSet
+from common.lib.exceptions import DataSetException
+from webtool.lib import access_tokens
 from webtool.lib.helpers import error, generate_css_colours, setting_required
 from common.lib.helpers import send_email, get_software_commit
 from common.config_manager import ConfigWrapper
@@ -48,7 +53,10 @@ def load_user_from_request(request):
     Load user object via access token
 
     Access token may be supplied via a GET parameter or the Authorization
-    HTTP header.
+    HTTP header. New-style tokens (``token_id.secret``) authenticate against
+    the scoped token series tables with their frozen privilege snapshot;
+    bare 64-character tokens are legacy tokens from the ``access_tokens``
+    table.
 
     :param request:  Flask request
     :return:  User object, or None if no valid access token was given
@@ -66,6 +74,19 @@ def load_user_from_request(request):
     if not token:
         return None
 
+    # new-style per-integration tokens with scopes, dataset boundaries and
+    # frozen authorisation snapshots
+    if access_tokens.parse_presented_token(token):
+        auth = access_tokens.authenticate(current_app.db, token)
+        if not auth:
+            return None
+        auth["context"]["username"] = auth["user_row"]["name"]
+        user = access_tokens.TokenUser(current_app.db, auth["user_row"], auth["context"])
+        access_tokens.TokenConfigWrapper(current_app.fourcat_config, user=user,
+                                         snapshot=auth["context"]["snapshot"], request=request)
+        return user
+
+    # legacy plaintext token: unchanged semantics
     user = current_app.db.fetchone("SELECT name AS user FROM access_tokens WHERE token = %s AND (expires = 0 OR expires > %s)",
                        (token, int(time.time())))
     if not user:
@@ -556,9 +577,251 @@ def show_access_tokens():
     if user == "autologin":
         return error(403, message="You cannot view or generate access tokens without a personal acount.")
 
-    tokens = g.db.fetchall("SELECT * FROM access_tokens WHERE name = %s", (user,))
+    if getattr(current_user, "api_token", None):
+        # token management always requires an interactive session
+        return error(403, message="Access tokens cannot be managed through an API token.")
 
-    return render_template("access-tokens.html", tokens=tokens)
+    return _render_access_tokens_page()
+
+
+def _parse_dataset_keys(raw):
+    """
+    Parse dataset keys submitted as whitespace/comma-separated input
+
+    Accepts bare keys or dataset URLs (the last path component is used).
+    """
+    keys = []
+    for part in re.split(r"[\s,]+", raw or ""):
+        part = part.strip().rstrip("/")
+        if not part:
+            continue
+        key = part.split("/")[-1]
+        if key and key not in keys:
+            keys.append(key)
+    return keys
+
+
+def _render_access_tokens_page(revealed=None):
+    """
+    Render the access token management page
+
+    :param dict revealed: when set, a freshly created/rotated presented token
+    to display exactly once in the response
+    """
+    user = current_user.get_id()
+    now = int(time.time())
+
+    # scopes the current user may grant, given their live privileges
+    available_scopes = []
+    for scope in access_tokens.SCOPES:
+        granted = all(g.config.get(prerequisite) for prerequisite in scope["prerequisites"])
+        available_scopes.append({
+            "id": scope["id"],
+            "label": scope["label"],
+            "description": scope["description"],
+            "granted": granted,
+        })
+
+    series_rows = access_tokens.list_user_series(g.db, user, now=now)
+
+    # generation metadata per series, for showing the series relationship
+    generation_rows = g.db.fetchall(
+        "SELECT token_id, generation, overlap_until, last_used, revoked, timestamp_created "
+        "FROM access_token_generations "
+        "WHERE token_id IN (SELECT token_id FROM access_token_series WHERE name = %s) "
+        "ORDER BY generation",
+        (user,))
+    generations_by_series = {}
+    for generation in generation_rows:
+        generations_by_series.setdefault(generation["token_id"], []).append(generation)
+
+    series = []
+    for row in series_rows:
+        generations = generations_by_series.get(row["token_id"], [])
+        row["generations"] = generations
+        row["overlapping_generations"] = [
+            generation for generation in generations
+            if generation["generation"] < row["current_generation"]
+            and generation["overlap_until"] > now
+            and not generation["revoked"]
+        ]
+        row["form_nonce"] = uuid.uuid4().hex
+        series.append(row)
+
+    # legacy plaintext tokens: never send the full value to the template
+    legacy_tokens = []
+    for token in g.db.fetchall("SELECT * FROM access_tokens WHERE name = %s", (user,)):
+        plaintext = token.get("token") or ""
+        legacy_tokens.append({
+            "masked": (plaintext[:10] + "\u2026") if plaintext else "",
+            "calls": token.get("calls", 0),
+            "expires": token.get("expires", 0),
+            "expired": bool(token.get("expires")) and token["expires"] <= now,
+        })
+
+    response = make_response(render_template("access-tokens.html",
+                               available_scopes=available_scopes,
+                               scope_definitions=access_tokens.SCOPE_BY_ID,
+                               dataset_access_modes=(
+                                   (access_tokens.DATASET_ACCESS_ALL, "All datasets I can access"),
+                                   (access_tokens.DATASET_ACCESS_OWNED, "Only datasets I own"),
+                                   (access_tokens.DATASET_ACCESS_LISTED, "Only selected datasets"),
+                               ),
+                               expiry_presets=access_tokens.EXPIRY_PRESETS_DAYS,
+                               overlap_options=(
+                                   (0, "none (old secret stops immediately)"),
+                                   (3600, "1 hour"),
+                                   (86400, "24 hours"),
+                                   (7 * 86400, "7 days"),
+                               ),
+                               default_expiry_days=access_tokens.DEFAULT_EXPIRY_DAYS,
+                               series=series,
+                               legacy_tokens=legacy_tokens,
+                               create_nonce=uuid.uuid4().hex,
+                               revealed=revealed))
+    if revealed:
+        # the one-time secret must not end up in a browser cache
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@component.route("/access-tokens/create", methods=["POST"])
+@login_required
+@setting_required("privileges.can_create_api_token")
+def create_access_token():
+    """
+    Create a new named, scoped access token series
+
+    The presented token is shown exactly once in the response.
+    """
+    if current_user.is_special or getattr(current_user, "api_token", None):
+        return error(403, message="You cannot create access tokens with this account.")
+
+    now = int(time.time())
+    nonce = (request.form.get("nonce") or "").strip()
+    if not nonce:
+        flash("Invalid form submission, please try again.")
+        return redirect(url_for("user.show_access_tokens"))
+
+    label = None
+    try:
+        label = access_tokens.normalise_label(request.form.get("label"))
+        scopes = access_tokens.normalise_scopes(request.form.getlist("scopes"), g.config)
+        dataset_keys = _parse_dataset_keys(request.form.get("dataset_keys"))
+        dataset_access, dataset_keys = access_tokens.normalise_dataset_access(
+            request.form.get("dataset_access"), dataset_keys)
+
+        if dataset_access == access_tokens.DATASET_ACCESS_LISTED:
+            valid_keys = []
+            for key in dataset_keys:
+                try:
+                    dataset = DataSet(key=key, db=g.db, modules=g.modules)
+                except DataSetException:
+                    raise access_tokens.AccessTokenError("Dataset '%s' does not exist." % key)
+                if not current_user.can_access_dataset(dataset):
+                    raise access_tokens.AccessTokenError(
+                        "You do not currently have access to dataset '%s'." % key, status=403)
+                valid_keys.append(dataset.key)
+            dataset_keys = valid_keys
+
+        expires = access_tokens.normalise_expiry(
+            request.form.get("expires"), request.form.get("expires_custom"), now=now)
+
+        snapshot = access_tokens.build_snapshot(current_user, current_app.fourcat_config)
+        result = access_tokens.create_series(
+            g.db, current_user.get_id(), label, scopes, dataset_access, dataset_keys,
+            snapshot, expires, nonce, now=now)
+
+    except access_tokens.AccessTokenError as e:
+        flash(str(e))
+        return redirect(url_for("user.show_access_tokens"))
+
+    if result["converged"]:
+        flash("This form was already submitted. A token's secret is shown only once and cannot be "
+              "displayed again; rotate the token if you need a new secret.")
+        return redirect(url_for("user.show_access_tokens"))
+
+    return _render_access_tokens_page(revealed={
+        "presented": result["presented"],
+        "label": label,
+        "generation": result["generation"],
+        "action": "created",
+    })
+
+
+@component.route("/access-tokens/<token_id>/rotate", methods=["POST"])
+@login_required
+@setting_required("privileges.can_create_api_token")
+def rotate_access_token(token_id):
+    """
+    Rotate a token series: a new generation becomes valid immediately, the
+    previous generation retires after the chosen overlap window.
+    """
+    if current_user.is_special or getattr(current_user, "api_token", None):
+        return error(403, message="You cannot rotate access tokens with an API token.")
+
+    now = int(time.time())
+    nonce = (request.form.get("nonce") or "").strip()
+    if not nonce:
+        flash("Invalid form submission, please try again.")
+        return redirect(url_for("user.show_access_tokens"))
+
+    label = request.form.get("label", "")
+    try:
+        overlap = access_tokens.normalise_overlap(request.form.get("overlap"))
+        result = access_tokens.rotate_series(
+            g.db, token_id, current_user.get_id(), overlap, nonce, now=now)
+    except access_tokens.AccessTokenError as e:
+        flash(str(e))
+        return redirect(url_for("user.show_access_tokens"))
+
+    if result["converged"]:
+        flash("This form was already submitted. The new secret was shown only once and cannot be "
+              "displayed again; rotate again if you need a new secret.")
+        return redirect(url_for("user.show_access_tokens"))
+
+    return _render_access_tokens_page(revealed={
+        "presented": result["presented"],
+        "label": label,
+        "generation": result["generation"],
+        "action": "rotated",
+    })
+
+
+@component.route("/access-tokens/<token_id>/revoke", methods=["POST"])
+@login_required
+@setting_required("privileges.can_create_api_token")
+def revoke_access_token(token_id):
+    """
+    Revoke a token series and all of its generations. Other series are not
+    affected.
+    """
+    if current_user.is_special or getattr(current_user, "api_token", None):
+        return error(403, message="You cannot revoke access tokens with an API token.")
+
+    try:
+        access_tokens.revoke_series(g.db, token_id, current_user.get_id())
+    except access_tokens.AccessTokenError as e:
+        flash(str(e))
+    else:
+        flash("Token revoked. Any scripts using it can no longer authenticate.")
+    return redirect(url_for("user.show_access_tokens"))
+
+
+@component.route("/access-tokens/legacy/delete", methods=["POST"])
+@login_required
+@setting_required("privileges.can_create_api_token")
+def delete_legacy_access_token():
+    """
+    Revoke (delete) the legacy plaintext token for the current user.
+    """
+    if current_user.is_special or getattr(current_user, "api_token", None):
+        return error(403, message="You cannot manage access tokens with an API token.")
+
+    access_tokens.delete_legacy_token(g.db, current_user.get_id())
+    flash("Legacy token revoked.")
+    return redirect(url_for("user.show_access_tokens"))
+
 
 @component.route("/view-notification/<int:notification_id>")
 def view_notification(notification_id):

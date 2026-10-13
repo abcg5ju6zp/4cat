@@ -4,63 +4,268 @@
 {% block body_class %}plain-page token-page{% endblock %}
 {% block breadcrumbs %}{% set navigation.current = "api-access" %}{% endblock %}
 
+{% block head %}
+	{{ super() }}
+	<style>
+		.token-secret-reveal { border: 1px solid #b59b91; background: #fbf3f0; padding: 1em 1.25em; margin: 1em 0; }
+		.token-secret-reveal code { display: block; word-break: break-all; user-select: all; margin: .5em 0; }
+		.scope-chip, .status-chip { display: inline-block; border-radius: 3px; padding: .1em .5em; margin: .1em .2em .1em 0; font-size: .85em; border: 1px solid #c9c9c9; }
+		.status-chip.active, .status-chip.overlap { border-color: #7a9e7e; background: #eef5ee; }
+		.status-chip.expired, .status-chip.revoked { border-color: #b27a7a; background: #f8eeee; }
+		.token-list td, .token-list th { vertical-align: top; padding: .4em .6em; }
+		.token-actions form { display: inline; }
+		.token-meta { color: #777; font-size: .9em; }
+		details.token-rotate { margin-top: .4em; }
+	</style>
+{% endblock %}
+
 {% block body %}
     <article>
         <section>
             <h2><span>Access tokens</span></h2>
-            <p>{{ __user_config("4cat.name") }} has an API, which is documented with an OpenAPI-compatible specification
-                <a href="{{ url_for('toolapi.openapi_overview') }}">here</a>. Some API endpoints require authentication. You can generate an
-                access token through which to authenticate yourself on this page. Alternatively, tokens may be requested
-                programmatically via the <code>/api/request-token/</code> endpoint, when requested with a currently
-                logged-in
-                session.</p>
+            <p>{{ __user_config("4cat.name") }} has an API, documented with an OpenAPI-compatible specification
+                <a href="{{ url_for('toolapi.openapi_overview') }}">here</a>. Create one token per script or
+                integration: each token has its own name, operation scopes, dataset boundary and expiry, and can be
+                rotated or revoked without affecting your other integrations. A token's capabilities are frozen at
+                creation &mdash; gaining privileges later never widens an existing token, and removing the token's
+                permission source (e.g. a user tag) invalidates it.</p>
 
-            {% if not tokens %}
-                <form action="{{ url_for('toolapi.request_token') }}" method="GET" class="wide">
-                    <p>You currently have no active access token(s). Request one:</p>
-                    <div class="form-element form-footer">
-                        <input type="hidden" name="forward" value="yes">
-                        <button>Request token</button>
+            {% with messages = get_flashed_messages() %}
+                {% if messages %}
+                    <div class="form-notices-wrapper">
+                        {% for notice in messages %}
+                            <p class="form-notice">{{ notice }}</p>
+                        {% endfor %}
                     </div>
-                </form>
-            {% else %}
-                {% set now = __datenow.timestamp() %}
-                {% set has_expired = namespace(value=false) %}
+                {% endif %}
+            {% endwith %}
+
+            {% if revealed %}
+                <div class="token-secret-reveal">
+                    <h3>{% if revealed.action == "rotated" %}Rotated{% else %}New{% endif %} token
+                        &ldquo;{{ revealed.label }}&rdquo; (generation {{ revealed.generation }})</h3>
+                    <p class="warning-text">Copy this token now. It is shown <strong>exactly once</strong> and cannot be
+                        retrieved later &mdash; not even by you. If you lose it, rotate the token to get a new one.</p>
+                    <code id="revealed-token">{{ revealed.presented }}</code>
+                    <button type="button" data-copy-target="revealed-token">Copy token</button>
+                </div>
+            {% endif %}
+
+            <h3>Create a token</h3>
+            <form action="{{ url_for('user.create_access_token') }}" method="POST" class="wide">
+                <input type="hidden" name="nonce" value="{{ create_nonce }}">
+                <div class="form-element full-width">
+                    <label for="token-label">Integration name</label>
+                    <input type="text" id="token-label" name="label" maxlength="100" required
+                           placeholder="e.g. nightly Twitter collector">
+                    <p class="option-help">A unique name to recognise this integration by.</p>
+                </div>
+
+                <div class="form-element full-width">
+                    <div><strong>Scopes</strong> &mdash; what this token is allowed to do</div>
+                    {% for scope in available_scopes %}
+                        <div class="form-element combo-checkbox-input{% if not scope.granted %} disabled{% endif %}">
+                            <label>
+                                <input type="checkbox" name="scopes" value="{{ scope.id }}"
+                                       {% if not scope.granted %}disabled
+                                       title="Your account does not currently hold the required privilege"{% endif %}>
+                                {{ scope.label }} (<code>{{ scope.id }}</code>)
+                            </label>
+                            <p class="option-help">
+                                {{ scope.description }}
+                                {% if not scope.granted %}<strong>Unavailable for your account right now.</strong>{% endif %}
+                            </p>
+                        </div>
+                    {% endfor %}
+                </div>
+
+                <div class="form-element full-width">
+                    <div><strong>Dataset boundary</strong> &mdash; which datasets this token can access</div>
+                    {% for mode, label_text in dataset_access_modes %}
+                        <label>
+                            <input type="radio" name="dataset_access" value="{{ mode }}"
+                                   {% if loop.first %}checked{% endif %}
+                                   onchange="document.getElementById('dataset-keys').disabled = (this.value !== 'listed');">
+                            {{ label_text }}
+                        </label><br>
+                    {% endfor %}
+                    <textarea id="dataset-keys" name="dataset_keys" rows="2" disabled
+                              placeholder="Only for 'selected datasets': dataset keys or URLs, separated by commas or new lines"></textarea>
+                </div>
+
+                <div class="form-element full-width">
+                    <label for="token-expires"><strong>Expires</strong></label>
+                    <select id="token-expires" name="expires"
+                            onchange="document.getElementById('token-expires-custom').style.display = (this.value === 'custom' ? '' : 'none');">
+                        {% for days in expiry_presets %}
+                            <option value="{{ days }}"{% if days == default_expiry_days %} selected{% endif %}>
+                                after {{ days }} days
+                            </option>
+                        {% endfor %}
+                        <option value="custom">Custom date&hellip;</option>
+                        <option value="never">Never expires</option>
+                    </select>
+                    <input type="date" id="token-expires-custom" name="expires_custom" style="display: none;">
+                </div>
+
+                <div class="form-element form-footer">
+                    <button>Create token</button>
+                </div>
+            </form>
+
+            {% if series %}
+                <h3>Your integration tokens</h3>
+                <table class="token-list">
+                    <tr>
+                        <th>Name</th>
+                        <th>Series / generations</th>
+                        <th>Scopes</th>
+                        <th>Dataset boundary</th>
+                        <th>Expires</th>
+                        <th>Last used</th>
+                        <th>Status</th>
+                        <th>Actions</th>
+                    </tr>
+                    {% for token in series %}
+                        <tr class="token-row-{{ token.status }}">
+                            <td>{{ token.label }}</td>
+                            <td>
+                                <code>{{ token.token_id }}</code>
+                                <div class="token-meta">generation {{ token.current_generation }}</div>
+                                {% for generation in token.overlapping_generations %}
+                                    <div class="token-meta">generation {{ generation.generation }} works until
+                                        {{ generation.overlap_until|datetime|safe }}</div>
+                                {% endfor %}
+                            </td>
+                            <td>
+                                {% for scope_id in token.scopes %}
+                                    <span class="scope-chip">{{ scope_definitions[scope_id].label if scope_id in scope_definitions else scope_id }}</span>
+                                {% endfor %}
+                            </td>
+                            <td>
+                                {% if token.dataset_access == "all" %}
+                                    All accessible datasets
+                                {% elif token.dataset_access == "owned" %}
+                                    Owned only
+                                {% else %}
+                                    {{ token.dataset_keys|length }} selected
+                                    <span class="token-meta" title="{{ token.dataset_keys|join(', ') }}">
+                                        ({{ token.dataset_keys|join(', ')|truncate(48) }})
+                                    </span>
+                                {% endif %}
+                            </td>
+                            <td>
+                                {% if token.expires %}
+                                    {{ token.expires|datetime|safe }}
+                                {% else %}
+                                    Never
+                                {% endif %}
+                            </td>
+                            <td>
+                                {% if token.last_used %}{{ token.last_used|datetime|safe }}{% else %}&mdash;{% endif %}
+                                <div class="token-meta">{{ token.calls }} calls</div>
+                            </td>
+                            <td><span class="status-chip {{ token.status }}">{{ token.status }}</span></td>
+                            <td class="token-actions">
+                                {% if token.status in ["active", "overlap"] %}
+                                    <details class="token-rotate">
+                                        <summary>Rotate</summary>
+                                        <form action="{{ url_for('user.rotate_access_token', token_id=token.token_id) }}"
+                                              method="POST">
+                                            <input type="hidden" name="nonce" value="{{ token.form_nonce }}">
+                                            <input type="hidden" name="label" value="{{ token.label }}">
+                                            <label>
+                                                Overlap:
+                                                <select name="overlap">
+                                                    {% for seconds, label_text in overlap_options %}
+                                                        <option value="{{ seconds }}"{% if seconds == 0 %} selected{% endif %}>{{ label_text }}</option>
+                                                    {% endfor %}
+                                                </select>
+                                            </label>
+                                            <button>Rotate</button>
+                                            <p class="option-help">The new generation works immediately; the old one
+                                                keeps working during the overlap window, then stops automatically.</p>
+                                        </form>
+                                    </details>
+                                {% endif %}
+                                {% if token.status != "revoked" %}
+                                    <form action="{{ url_for('user.revoke_access_token', token_id=token.token_id) }}"
+                                          method="POST" class="token-revoke-form">
+                                        <button class="warning-text">Revoke</button>
+                                    </form>
+                                {% else %}
+                                    <span class="token-meta">&mdash;</span>
+                                {% endif %}
+                            </td>
+                        </tr>
+                    {% endfor %}
+                </table>
+            {% endif %}
+
+            {% if legacy_tokens %}
+                <h3>Legacy token</h3>
+                <p>This token predates per-integration scopes: it carries all of your current privileges and expires on
+                    its own schedule. Prefer creating a scoped token for new integrations.</p>
                 <table class="token-list">
                     <tr>
                         <th>Token</th>
                         <th>Calls so far</th>
                         <th>Expiration</th>
+                        <th>Actions</th>
                     </tr>
-                    {% for token in tokens %}
-                        {% set is_expired = token.expires < now %}
-                        {% if is_expired %}{% set has_expired.value = true %}{% endif %}
-                        <tr{% if is_expired %} class="expired"{% endif %}>
-                            <td><code>{{ token.token }}</code></td>
+                    {% for token in legacy_tokens %}
+                        <tr{% if token.expired %} class="expired"{% endif %}>
+                            <td><code>{{ token.masked }}</code></td>
                             <td>{{ token.calls }}</td>
                             <td>
-                                {{ token.expires|datetime|safe }}
-                                {% if is_expired %}<span class="token-expired"> (expired)</span>{% endif %}
+                                {% if token.expires %}{{ token.expires|datetime|safe }}{% else %}Never{% endif %}
+                                {% if token.expired %}<span class="token-expired"> (expired)</span>{% endif %}
+                            </td>
+                            <td>
+                                <form action="{{ url_for('user.delete_legacy_access_token') }}" method="POST"
+                                      class="token-revoke-form">
+                                    <button class="warning-text">Revoke</button>
+                                </form>
                             </td>
                         </tr>
                     {% endfor %}
                 </table>
-                
-                {% if has_expired.value %}
-                    <form action="{{ url_for('toolapi.request_token') }}" method="GET" class="wide" style="margin-top: 1em;">
-                        <p>One or more of your tokens has expired. Request a new one:</p>
-                        <div class="form-element form-footer">
-                            <input type="hidden" name="forward" value="yes">
-                            <button>Request new token</button>
-                        </div>
-                    </form>
-                {% endif %}
             {% endif %}
 
+            <h3>Using a token</h3>
             <p>Tokens can be passed to API calls in two ways; via a <code>GET</code> parameter, <code>access-token</code>:</p>
             <p><code>/api/endpoint?access-token=[token]</code></p>
             <p>Alternatively, you can pass it as a request header, <code>Authentication</code>:</p>
-            <p><code>headers = {"Authentication": "[access-token]"}</code></p>
+            <p><code>headers = {"Authentication": "[token]"}</code></p>
+            <p class="token-meta">The legacy <code>Authorization</code> header is accepted as well. You can also still
+                get the legacy token programmatically via <code>/api/request-token/</code> while logged in.</p>
         </section>
     </article>
+
+    <script>
+        document.querySelectorAll("[data-copy-target]").forEach(function (button) {
+            button.addEventListener("click", function () {
+                const target = document.getElementById(button.dataset.copyTarget);
+                if (navigator.clipboard) {
+                    navigator.clipboard.writeText(target.textContent.trim());
+                } else {
+                    const range = document.createRange();
+                    range.selectNodeContents(target);
+                    const selection = window.getSelection();
+                    selection.removeAllRanges();
+                    selection.addRange(range);
+                }
+                const original = button.textContent;
+                button.textContent = "Copied!";
+                setTimeout(function () { button.textContent = original; }, 1500);
+            });
+        });
+        document.querySelectorAll(".token-revoke-form").forEach(function (form) {
+            form.addEventListener("submit", function (event) {
+                if (!confirm("Revoke this token? Every generation of it stops working immediately and this cannot be undone.")) {
+                    event.preventDefault();
+                }
+            });
+        });
+    </script>
 {% endblock %}

@@ -146,13 +146,56 @@ INSERT INTO users
   VALUES ('anonymous', ''), ('autologin', '')
   ON CONFLICT DO NOTHING;
 
--- access tokens
+-- access tokens (legacy: one plaintext token per user)
 CREATE TABLE IF NOT EXISTS access_tokens (
   name TEXT UNIQUE PRIMARY KEY,
   token TEXT,
   calls INTEGER DEFAULT 0,
   expires INTEGER DEFAULT 0
 );
+
+-- scoped access tokens: one series per integration, with rotating generations
+CREATE TABLE IF NOT EXISTS access_token_series (
+  token_id          TEXT UNIQUE PRIMARY KEY,
+  name              TEXT NOT NULL,
+  label             TEXT NOT NULL,
+  scopes            JSONB DEFAULT '[]',
+  dataset_access    TEXT DEFAULT 'all',
+  dataset_keys      JSONB DEFAULT '[]',
+  auth_snapshot     JSONB DEFAULT '{}',
+  source_tags       JSONB DEFAULT '[]',
+  expires           INTEGER DEFAULT 0,
+  revoked           BOOLEAN DEFAULT FALSE,
+  timestamp_created INTEGER DEFAULT 0,
+  timestamp_rotated INTEGER DEFAULT 0,
+  UNIQUE(name, label)
+);
+
+CREATE INDEX IF NOT EXISTS access_token_series_name_idx
+  ON access_token_series (
+    name
+  );
+
+CREATE TABLE IF NOT EXISTS access_token_generations (
+  token_id          TEXT NOT NULL REFERENCES access_token_series(token_id) ON DELETE CASCADE,
+  generation        INTEGER NOT NULL,
+  token_hash        TEXT NOT NULL,
+  request_nonce     TEXT DEFAULT '',
+  timestamp_created INTEGER DEFAULT 0,
+  overlap_until     INTEGER DEFAULT 0,
+  revoked           BOOLEAN DEFAULT FALSE,
+  last_used         INTEGER DEFAULT 0,
+  calls             INTEGER DEFAULT 0,
+  PRIMARY KEY (token_id, generation),
+  UNIQUE(token_hash)
+);
+
+-- idempotency anchor for create/rotate retries: one generation per nonce
+CREATE UNIQUE INDEX IF NOT EXISTS access_token_generations_nonce_idx
+  ON access_token_generations (
+    request_nonce
+  )
+  WHERE request_nonce <> '';
 
 
 -- favourites

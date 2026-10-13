@@ -35,6 +35,7 @@ from common.lib.queue import JobQueue  # noqa: E402
 from common.lib.module_loader import ModuleCollector  # noqa: E402
 
 from common.lib.user import User  # noqa: E402
+from webtool.lib.access_tokens import TokenConfigWrapper, enforce_api_only_token  # noqa: E402
 from webtool.lib.helpers import generate_css_colours  # noqa: E402
 from webtool.lib.openapi_collector import OpenAPICollector  # noqa: E402
 
@@ -190,6 +191,9 @@ with app.app_context():
     app.register_blueprint(webtool.views.api_standalone.component)
     app.register_blueprint(webtool.views.api_tool.component)
 
+    # scoped tokens authenticate against the API blueprints only
+    app.before_request(enforce_api_only_token)
+
     @app.before_request
     def before_request():
         """
@@ -207,10 +211,16 @@ with app.app_context():
         g.queue = queue
         g.db = db
         g.log = log
-        g.config = ConfigWrapper(app.fourcat_config, user=current_user, request=request)
+        if getattr(current_user, "api_token", None):
+            # scoped token requests are judged solely by the token's frozen
+            # privilege snapshot
+            g.config = TokenConfigWrapper(app.fourcat_config, user=current_user,
+                                          snapshot=current_user.api_token["snapshot"], request=request)
+        else:
+            g.config = ConfigWrapper(app.fourcat_config, user=current_user, request=request)
         g.modules = current_app.fourcat_modules
         g.request = request
-        current_user.with_config(g.config)
+        current_user.with_config(g.config, rewrap=False)
 
     def get_datasource_explorer_templates(name):
         """ Load Explorer templates from datasources """

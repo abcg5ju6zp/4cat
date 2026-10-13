@@ -13,6 +13,7 @@ from flask import Blueprint, current_app, jsonify, request, render_template, ren
 	get_flashed_messages, send_from_directory, stream_with_context, g
 from flask_login import login_required, current_user
 
+from webtool.lib import access_tokens
 from webtool.lib.helpers import error, setting_required, parse_markdown
 
 from common.lib.exceptions import QueryParametersException, JobNotFoundException, \
@@ -27,6 +28,9 @@ from common.lib.item_mapping import MissingMappedField
 
 component = Blueprint("toolapi", __name__)
 api_ratelimit = current_app.limiter.shared_limit("3 per second", scope="api")
+
+# scoped API tokens may only reach endpoints covered by their scopes
+component.before_request(access_tokens.enforce_token_scope)
 
 API_SUCCESS = 200
 API_FAIL = 404
@@ -171,6 +175,10 @@ def collect_available_processors(dataset_key):
 	except DataSetException:
 		return error(404, error="Not a valid dataset key.")
 
+	boundary_error = access_tokens.enforce_dataset_boundary(dataset)
+	if boundary_error:
+		return boundary_error
+
 	if not g.config.get("privileges.admin.can_manipulate_all_datasets") and not current_user.can_access_dataset(dataset):
 		return error(403, error="You do not have access to this dataset")
 
@@ -223,7 +231,11 @@ def get_processor_options(processor_type, dataset_id=None):
 			dataset = DataSet(key=dataset_id, db=g.db, modules=g.modules)
 		except DataSetException:
 			return error(404, message="Dataset '%s' does not exist" % dataset_id)
-		
+
+		boundary_error = access_tokens.enforce_dataset_boundary(dataset)
+		if boundary_error:
+			return boundary_error
+
 		# Check compatibility of processor with dataset
 		if not processor.is_compatible_with(dataset, g.config):
 			return error(422, message="Processor '%s' is not compatible with dataset '%s'" % (processor_type, dataset_id))
@@ -584,6 +596,10 @@ def check_dataset():
 	except DataSetException:
 		return error(404, error="Dataset does not exist.")
 
+	boundary_error = access_tokens.enforce_dataset_boundary(dataset)
+	if boundary_error:
+		return boundary_error
+
 	if not current_user.can_access_dataset(dataset):
 		return error(403, error="Dataset is private")
 
@@ -654,6 +670,10 @@ def edit_dataset_label(key):
 	except DataSetException:
 		return error(404, error="Dataset does not exist.")
 
+	boundary_error = access_tokens.enforce_dataset_boundary(dataset)
+	if boundary_error:
+		return boundary_error
+
 	if not g.config.get("privileges.admin.can_manipulate_all_datasets") and not dataset.is_accessible_by(current_user, "owner"):
 		return error(403, message="Not allowed")
 
@@ -698,6 +718,10 @@ def convert_dataset(key):
 		dataset = DataSet(key=dataset_key, db=g.db, modules=g.modules)
 	except DataSetException:
 		return error(404, error="Dataset does not exist.")
+
+	boundary_error = access_tokens.enforce_dataset_boundary(dataset)
+	if boundary_error:
+		return boundary_error
 
 	if not current_user.is_admin:
 		return error(403, message="Not allowed")
@@ -746,6 +770,10 @@ def nuke_dataset(key=None, reason=None):
 		dataset = DataSet(key=dataset_key, db=g.db, modules=g.modules)
 	except DataSetException:
 		return error(404, error="Dataset does not exist.")
+
+	boundary_error = access_tokens.enforce_dataset_boundary(dataset)
+	if boundary_error:
+		return boundary_error
 
 	if not current_user.is_admin:
 		return error(403, message="Not allowed")
@@ -820,6 +848,10 @@ def delete_dataset(key=None):
 	except DataSetException:
 		return error(404, error="Dataset does not exist.")
 
+	boundary_error = access_tokens.enforce_dataset_boundary(dataset)
+	if boundary_error:
+		return boundary_error
+
 	if not g.config.get("privileges.admin.can_manipulate_all_datasets") and not dataset.is_accessible_by(current_user, "owner"):
 		return error(403, message="Not allowed")
 
@@ -866,6 +898,10 @@ def erase_credentials(key=None):
 		dataset = DataSet(key=dataset_key, db=g.db, modules=g.modules)
 	except DataSetException:
 		return error(404, error="Dataset does not exist.")
+
+	boundary_error = access_tokens.enforce_dataset_boundary(dataset)
+	if boundary_error:
+		return boundary_error
 
 	if not g.config.get("privileges.admin.can_manipulate_all_datasets") and not dataset.is_accessible_by(current_user, "owner"):
 		return error(403, message="Not allowed")
@@ -965,6 +1001,10 @@ def add_dataset_owner(key=None, username=None, role=None):
 	except DataSetException:
 		return error(404, error="Dataset does not exist.")
 
+	boundary_error = access_tokens.enforce_dataset_boundary(dataset)
+	if boundary_error:
+		return boundary_error
+
 	if not g.config.get("privileges.admin.can_manipulate_all_datasets") and not dataset.is_accessible_by(current_user, "owner"):
 		return error(403, message="Not allowed")
 
@@ -1025,6 +1065,10 @@ def remove_dataset_owner(key=None, username=None):
 		dataset = DataSet(key=dataset_key, db=g.db, modules=g.modules)
 	except DataSetException:
 		return error(404, error="Dataset does not exist.")
+
+	boundary_error = access_tokens.enforce_dataset_boundary(dataset)
+	if boundary_error:
+		return boundary_error
 
 	if not g.config.get("privileges.admin.can_manipulate_all_datasets") and not dataset.is_accessible_by(current_user, "owner"):
 		return error(403, error="Not allowed")
@@ -1089,6 +1133,10 @@ def toggle_favourite(key):
 	except DataSetException:
 		return error(404, error="Dataset does not exist.")
 
+	boundary_error = access_tokens.enforce_dataset_boundary(dataset)
+	if boundary_error:
+		return boundary_error
+
 	if not current_user.can_access_dataset(dataset):
 		return error(403, error="This dataset is private")
 
@@ -1131,6 +1179,10 @@ def toggle_private(key):
 		dataset = DataSet(key=key, db=g.db, modules=g.modules)
 	except DataSetException:
 		return error(404, error="Dataset does not exist.")
+
+	boundary_error = access_tokens.enforce_dataset_boundary(dataset)
+	if boundary_error:
+		return boundary_error
 
 	if not g.config.get("privileges.admin.can_manipulate_all_datasets") and not dataset.is_accessible_by(current_user, "owner"):
 		return error(403, error="This dataset is private")
@@ -1197,6 +1249,10 @@ def queue_processor(key=None, processor=None):
 		dataset = DataSet(key=key, db=g.db, modules=g.modules)
 	except DataSetException:
 		return error(404, error="Not a valid dataset key.")
+
+	boundary_error = access_tokens.enforce_dataset_boundary(dataset)
+	if boundary_error:
+		return boundary_error
 
 	if not g.config.get(
 		"privileges.admin.can_manipulate_all_datasets"
@@ -1345,6 +1401,7 @@ def check_processor():
 
 	children = []
 
+	token_context = getattr(current_user, "api_token", None)
 	for key in keys:
 		try:
 			dataset = DataSet(key=key, db=g.db, modules=g.modules)
@@ -1352,6 +1409,10 @@ def check_processor():
 			continue
 
 		if not current_user.can_access_dataset(dataset):
+			continue
+
+		if token_context and not access_tokens.token_dataset_access_allowed(
+				token_context, dataset, username=current_user.get_id()):
 			continue
 
 		if dataset.is_top_dataset():
@@ -1456,6 +1517,10 @@ def export_packed_dataset(key=None, component=None):
 		dataset = DataSet(key=key, db=g.db, modules=g.modules)
 	except DataSetException:
 		return error(404, error="Dataset not found.")
+
+	boundary_error = access_tokens.enforce_dataset_boundary(dataset)
+	if boundary_error:
+		return boundary_error
 
 	# an export holds the dataset's full database record, including all
 	# parameters and the log, so viewing access is not enough: only owners and
@@ -1612,6 +1677,10 @@ def dataset_items(key):
 		dataset = DataSet(key=key, db=g.db, modules=g.modules)
 	except DataSetException:
 		return error(404, error="Dataset not found.")
+
+	boundary_error = access_tokens.enforce_dataset_boundary(dataset)
+	if boundary_error:
+		return boundary_error
 
 	if dataset.is_private and not (
 			g.config.get("privileges.can_view_private_datasets")

@@ -11,6 +11,7 @@ import csv
 from flask import Blueprint, current_app, jsonify, request, send_file, after_this_request, g
 from flask_login import login_required, current_user
 
+from webtool.lib import access_tokens
 from webtool.lib.helpers import error, setting_required
 
 from common.lib.exceptions import JobNotFoundException
@@ -25,6 +26,9 @@ csv.field_size_limit(1024 * 1024 * 1024)
 
 component = Blueprint("standalone", __name__)
 api_ratelimit = current_app.limiter.shared_limit("45 per minute", scope="api")
+
+# scoped API tokens may only reach endpoints covered by their scopes
+component.before_request(access_tokens.enforce_token_scope)
 
 @component.route("/api/get-standalone-processors/")
 @api_ratelimit
