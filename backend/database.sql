@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   timestamp_lastclaimed  integer DEFAULT 0,
   timestamp_claimed      integer DEFAULT 0,
   attempts               integer DEFAULT 0,
-  interval               integer DEFAULT 0
+  interval               integer DEFAULT 0,
+  attempt_id             text DEFAULT ''
 );
 
 -- enforce
@@ -38,6 +39,28 @@ CREATE UNIQUE INDEX IF NOT EXISTS unique_job
   );
 
 CREATE INDEX IF NOT EXISTS job_queue ON jobs (queue_id);
+
+-- one row per claim/processing attempt of a job; drives isolated staging,
+-- atomic publication, crash reconciliation and attempt-based arbitration
+CREATE TABLE IF NOT EXISTS job_attempts (
+  attempt_id          TEXT PRIMARY KEY,
+  jobtype             text DEFAULT 'misc',
+  remote_id           text,
+  status              text DEFAULT 'running',
+  phase               text DEFAULT 'claimed',
+  input_signature     text DEFAULT '{}',
+  manifest            text DEFAULT '{}',
+  pending_children    text DEFAULT '[]',
+  error               text DEFAULT '',
+  owner               text DEFAULT '',
+  heartbeat_at        integer DEFAULT 0,
+  timestamp_created   integer,
+  timestamp_updated   integer,
+  timestamp_finished  integer DEFAULT NULL
+);
+
+CREATE INDEX IF NOT EXISTS job_attempts_job ON job_attempts (jobtype, remote_id);
+CREATE INDEX IF NOT EXISTS job_attempts_status ON job_attempts (status);
 
 -- queries
 CREATE TABLE IF NOT EXISTS datasets (
@@ -61,7 +84,8 @@ CREATE TABLE IF NOT EXISTS datasets (
   software_version    text,
   software_file       text DEFAULT '',
   software_source     text DEFAULT '',
-  annotation_fields   text DEFAULT ''
+  annotation_fields   text DEFAULT '',
+  attempt_id          text DEFAULT ''
 );
 
 CREATE TABLE datasets_owners (

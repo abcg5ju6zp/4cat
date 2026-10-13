@@ -14,6 +14,7 @@ from common.lib.queue import JobQueue
 from common.lib.database import Database
 from common.lib.exceptions import WorkerInterruptedException, ProcessorException
 from common.config_manager import ConfigWrapper
+from common.lib.attempt import AttemptStatus
 
 class BasicWorker(threading.Thread, metaclass=abc.ABCMeta):
     """
@@ -50,6 +51,10 @@ class BasicWorker(threading.Thread, metaclass=abc.ABCMeta):
     #: Job this worker is being run for
     job = None
 
+    #: Attempt this worker's claim is bound to (None for workers created
+    #: outside the delegator, e.g. in tests)
+    attempt = None
+
     #: Local configuration (used in processors)
     config = None
 
@@ -68,7 +73,7 @@ class BasicWorker(threading.Thread, metaclass=abc.ABCMeta):
     #: Unix timestamp at which this worker was started
     init_time = 0
 
-    def __init__(self, logger, job, queue=None, manager=None, modules=None):
+    def __init__(self, logger, job, queue=None, manager=None, modules=None, attempt=None):
         """
         Worker init
 
@@ -88,6 +93,7 @@ class BasicWorker(threading.Thread, metaclass=abc.ABCMeta):
         self.log = logger
         self.manager = manager
         self.job = job
+        self.attempt = attempt
         self.init_time = int(time.time())
         self.queue = queue
 
@@ -123,20 +129,42 @@ class BasicWorker(threading.Thread, metaclass=abc.ABCMeta):
             self.work()
 
             # workers should usually finish their jobs by themselves, but if
-            # the worker finished without errors, the job can be finished in
-            # any case
+            # the worker finished without errors, the job in the job in
+            # any case. Processor jobs are attempt-aware (conditional finish);
+            # a no-op here means a newer attempt owns the job, so this late
+            # worker performs no further side effects.
             if not self.job.is_finished:
-                self.job.finish()
+                if self.attempt is not None and self.is_4cat_processor():
+                    self.job.finish(attempt_id=self.attempt.id)
+                else:
+                    self.job.finish()
 
+            # processors close their own attempts in the publication gate or
+            # abort paths; only close lightweight (system/scraper) attempts
+            if self.attempt is not None and not self.attempt.is_terminal \
+                    and not self.is_4cat_processor() and self.job.is_finished:
+                self.attempt.finalize(AttemptStatus.COMMITTED)
         except WorkerInterruptedException:
             self.log.info("Worker %s interrupted - cancelling." % self.type)
 
             # interrupted - retry later or cancel job altogether?
             if self.interrupted == self.INTERRUPT_RETRY:
-                self.job.release(delay=10)
+                if self.attempt is not None and self.is_4cat_processor():
+                    self.job.release(delay=10, attempt_id=self.attempt.id)
+                else:
+                    self.job.release(delay=10)
             elif self.interrupted == self.INTERRUPT_CANCEL:
-                self.job.finish()
-
+                # processors finalise their own attempt in abort(); only
+                # finalise lightweight attempts here, and never touch a job a
+                # newer attempt already owns
+                if self.attempt is not None and not self.attempt.is_terminal \
+                        and not self.is_4cat_processor() and not self.job.is_finished:
+                    self.attempt.finalize(AttemptStatus.CANCELLED)
+                if not self.job.is_finished:
+                    if self.attempt is not None and self.is_4cat_processor():
+                        self.job.finish(attempt_id=self.attempt.id)
+                    else:
+                        self.job.finish()
             self.abort()
         except ProcessorException as e:
             self.log.error(str(e), frame=e.frame)
@@ -189,10 +217,13 @@ class BasicWorker(threading.Thread, metaclass=abc.ABCMeta):
             # the worker already finalised the job before crashing
             return
 
+        if self.attempt is not None and not self.attempt.is_terminal:
+            self.attempt.finalize(AttemptStatus.FAILED)
+
         if self.job.is_recurring:
             self.log.fatal("Worker %s crashed while processing recurring job %s - manaully release job for retry." % (self.type, self.job.data["remote_id"]))
-        
-        self.job.park()
+
+        self.job.park(attempt_id=self.attempt.id if self.attempt is not None else None)
 
     def clean_up(self):
         """

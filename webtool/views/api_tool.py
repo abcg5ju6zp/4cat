@@ -20,6 +20,7 @@ from common.lib.exceptions import QueryParametersException, JobNotFoundException
 from common.lib.queue import JobQueue
 from common.lib.job import Job
 from common.lib.dataset import DataSet
+from common.lib.attempt import attempt_status_payload
 from common.lib.helpers import UserInput, call_api, get_software_commit, get_software_version, get_git_branch
 from common.lib.user import User
 from backend.lib.worker import BasicWorker
@@ -615,7 +616,8 @@ def check_dataset():
 		"empty": (dataset.data["num_rows"] == 0),
 		"is_favourite": (g.db.fetchone("SELECT COUNT(*) AS num FROM users_favourites WHERE name = %s AND key = %s",
 									 (current_user.get_id(), dataset.key))["num"] > 0),
-		"url": url_for("dataset.show_result", key=dataset.key, _external=True)
+		"url": url_for("dataset.show_result", key=dataset.key, _external=True),
+		"attempt": attempt_status_payload(g.db, dataset.key),
 	}
 
 	return jsonify(status)
@@ -1379,6 +1381,7 @@ def check_processor():
 			"key": dataset.key,
 			"finished": dataset.is_finished(),
 			"progress": round(dataset.get_progress() * 100),
+			"attempt": attempt_status_payload(g.db, dataset.key),
 			"html": render_template("components/result-child.html", child=dataset, dataset=parent,
                                     query=dataset.get_genealogy()[0], parent_key=top_parent.key,
                                     processors=g.modules.processors),

@@ -106,6 +106,15 @@ class JobNotFoundException(QueueException):
     pass
 
 
+class LostArbitrationException(QueueException):
+    """
+    Raised when a worker's attempt lost ownership of its job before or during
+    publication (cancel, duplicate claim, newer attempt). The worker must stop
+    without any further side effects.
+    """
+    pass
+
+
 class QueryException(FourcatException):
     """
     Raise if there is an issue with form input while creating a dataset

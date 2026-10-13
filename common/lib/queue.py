@@ -5,6 +5,7 @@ import time
 import json
 
 from common.lib.job import Job
+from common.lib.dataset import _active_attempt
 
 
 class JobQueue:
@@ -190,8 +191,18 @@ class JobQueue:
 			"timestamp_after": claim_after,
 			"interval": interval,
 			"queue_id": queue_id,
-			"attempts": 0
+			"attempts": 0,
+			"attempt_id": ""
 		}
+
+		# jobs created by an in-flight attempt (next-chain children, preset
+		# pipelines) are buffered: they must not become claimable or visible
+		# until the attempt publishes atomically
+		active_attempt = _active_attempt.get()
+		if active_attempt is not None and dataset is not None \
+				and getattr(dataset, "data", {}).get("attempt_id") == active_attempt.id:
+			active_attempt.add_pending_child(data)
+			return Job.get_by_data(data, database=self.db)
 
 		self.db.insert("jobs", data, safe=True, constraints=("jobtype", "remote_id"))
 

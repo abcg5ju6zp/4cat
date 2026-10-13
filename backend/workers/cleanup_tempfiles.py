@@ -4,12 +4,95 @@ Delete old datasets
 import shutil
 import re
 import json
+import time
 from datetime import datetime
 from pathlib import Path
 
 from backend.lib.worker import BasicWorker
+from common.lib.attempt import ATTEMPTS_DIRNAME, AttemptStatus
 from common.lib.dataset import DataSet
 from common.lib.exceptions import WorkerInterruptedException, DataSetException
+
+#: terminal attempt statuses whose isolated directories may be garbage
+#: collected once they pass the grace period
+GC_TERMINAL_STATUSES = (
+    AttemptStatus.COMMITTED.value,
+    AttemptStatus.FAILED.value,
+    AttemptStatus.CANCELLED.value,
+    AttemptStatus.SUPERSEDED.value,
+)
+
+
+def _attempt_is_referenced(db, attempt_id):
+	"""
+	Whether any dataset row or job row still carries an attempt tag
+	"""
+	datasets = db.fetchone("SELECT COUNT(*) AS num FROM datasets WHERE attempt_id = %s", (attempt_id,))
+	jobs = db.fetchone("SELECT COUNT(*) AS num FROM jobs WHERE attempt_id = %s", (attempt_id,))
+	return ((datasets["num"] if datasets else 0) + (jobs["num"] if jobs else 0)) > 0
+
+
+def gc_attempt_directories(path_data, db, tracked_files, days_to_keep=7, log=None, now=None):
+	"""
+	Garbage collect isolated attempt areas
+
+	Deletes only directories of terminal (committed/failed/cancelled/
+	superseded) attempts whose finish time is older than the grace period and
+	that are no longer referenced by any dataset or job. Orphan directories
+	without an attempt row follow the same tracked-grace flow as legacy
+	orphaned result files. Running/publishing attempts and anything outside
+	the attempt area are never touched.
+
+	:param Path path_data:  4CAT data path
+	:param tracked_files:  Tracking dict (mutated in place)
+	:param int days_to_keep:  Grace period
+	:return list:  Names of deleted directories
+	"""
+	root = Path(path_data).joinpath(ATTEMPTS_DIRNAME)
+	if not root.is_dir():
+		return []
+
+	now = now if now is not None else time.time()
+	grace_seconds = days_to_keep * 86400
+	deleted = []
+
+	for directory in sorted(root.glob("*")):
+		if not directory.is_dir() or not re.fullmatch(r"[0-9a-f]{32}", directory.name):
+			continue
+
+		tracking_key = "%s/%s" % (ATTEMPTS_DIRNAME, directory.name)
+		row = db.fetchone(
+			"SELECT status, timestamp_finished FROM job_attempts WHERE attempt_id = %s",
+			(directory.name,),
+		)
+
+		may_delete = False
+		if row is None:
+			# orphan directory (row deleted or never created): track first
+			if tracking_key not in tracked_files:
+				tracked_files[tracking_key] = now + grace_seconds
+				if log is not None:
+					log.info("Unknown attempt directory %s, marking for deletion" % directory)
+			elif tracked_files[tracking_key] < now:
+				may_delete = True
+		elif row["status"] in GC_TERMINAL_STATUSES:
+			finished_at = row.get("timestamp_finished") or 0
+			if finished_at + grace_seconds < now:
+				if _attempt_is_referenced(db, directory.name):
+					if log is not None:
+						log.info("Keeping attempt directory %s: still referenced by datasets/jobs" % directory)
+				else:
+					may_delete = True
+		# running/publishing attempts are never collected
+
+		if may_delete:
+			shutil.rmtree(directory, ignore_errors=True)
+			tracked_files.pop(tracking_key, None)
+			deleted.append(directory.name)
+			if log is not None:
+				log.info("Deleted expired attempt directory %s" % directory)
+
+	return deleted
 
 
 class TempFileCleaner(BasicWorker):
@@ -110,6 +193,10 @@ class TempFileCleaner(BasicWorker):
 
                 continue
 
+            # never interpret the attempt area root itself as a result file
+            if file.name == ATTEMPTS_DIRNAME:
+                continue
+
             if file.is_dir() and "-staging" in file.stem and dataset.is_finished():
                 # staging area exists but dataset is marked as finished
                 # if the dataset is finished, the staging area should have been
@@ -121,6 +208,16 @@ class TempFileCleaner(BasicWorker):
                 elif tracked_files[file.name] < datetime.now().timestamp():
                     self.log.info("Dataset %s is finished, but staging area remains at %s, deleting folder" % (dataset.key, str(file)))
                     shutil.rmtree(file)
+
+        # Garbage collect isolated attempt areas (terminal + grace +
+        # unreferenced only)
+        gc_attempt_directories(
+            self.config.get('PATH_DATA'),
+            self.db,
+            tracked_files,
+            days_to_keep=self.days_to_keep,
+            log=self.log,
+        )
 
         # Update tracked files
         tracking_file.write_text(json.dumps(tracked_files))

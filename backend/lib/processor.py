@@ -1,6 +1,7 @@
 """
 Basic post-processor worker - should be inherited by workers to post-process results
 """
+import contextlib
 import traceback
 import inspect as py_inspect
 import zipfile
@@ -15,16 +16,72 @@ import time
 from pathlib import PurePath, Path
 
 from backend.lib.worker import BasicWorker
+from common.lib.attempt import Attempt, AttemptStatus, AttemptPhase, phase_at_least
 from common.lib.dataset import DataSet, StatusType
 from common.lib.compatibility import Compatibility
 from common.lib.fourcat_module import FourcatModule
 from common.lib.helpers import get_software_commit, remove_nuls, send_email, hash_to_md5, looks_like_email_address
 from common.lib.exceptions import (WorkerInterruptedException, ProcessorInterruptedException, ProcessorException,
-                                   DataSetException, MapItemException, AnnotationException)
+                                   DataSetException, MapItemException, AnnotationException,
+                                   LostArbitrationException)
+from common.lib.result_validation import (
+    ResultValidationError, build_candidate_manifest_entry, describe_files_folder, fsync_path, hash_file,
+)
 from common.config_manager import ConfigWrapper
 from common.lib.user import User
 
 csv.field_size_limit(1024 * 1024 * 1024)
+
+
+class _AttemptBoundJob:
+    """
+    Job wrapper used while a processor runs under an attempt
+
+    Processors (and some datasources) have always been allowed to call
+    `self.job.finish()` directly from `process()`; with atomic publication
+    such a call must not delete the jobs row before the publication
+    transaction. While the processor body executes, finish() is therefore
+    deferred to the gate; release()/park() keep working but are conditioned
+    on the current attempt, so a late worker cannot move a newer attempt's
+    job.
+    """
+
+    def __init__(self, job, processor):
+        object.__setattr__(self, "_job", job)
+        object.__setattr__(self, "_processor", processor)
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_job"), name)
+
+    def __setattr__(self, name, value):
+        if name in ("is_finished", "is_claimed", "is_parked", "data"):
+            setattr(object.__getattribute__(self, "_job"), name, value)
+        else:
+            object.__setattr__(self, name, value)
+
+    def _attempt_id(self):
+        attempt = getattr(self._processor, "attempt", None)
+        return attempt.id if attempt is not None else None
+
+    def finish(self, delete=False, **kwargs):
+        # ignore stray kwargs and an explicitly passed attempt_id: the proxy
+        # always speaks for the processor's current attempt
+        kwargs.pop("attempt_id", None)
+        processor = self._processor
+        if getattr(processor, "_defer_job_finish", False):
+            # only a request: the row is deleted by the publication gate; on
+            # failure/cancel the crash/cancel paths must still own the job
+            processor._job_finish_requested = True
+            return True
+        return self._job.finish(delete=delete, attempt_id=self._attempt_id(), **kwargs)
+
+    def release(self, **kwargs):
+        kwargs.pop("attempt_id", None)
+        return self._job.release(attempt_id=self._attempt_id(), **kwargs)
+
+    def park(self, **kwargs):
+        kwargs.pop("attempt_id", None)
+        return self._job.park(attempt_id=self._attempt_id(), **kwargs)
 
 # Shared instance for the legacy default `compatibility`
 _DEFAULT_COMPATIBILITY = Compatibility(top_dataset_only=True)
@@ -121,6 +178,13 @@ class BasicProcessor(FourcatModule, BasicWorker, metaclass=abc.ABCMeta):
         of processing on that dataset, and then processes it. Afterwards, clean
         up.
         """
+        # processors may call self.job.finish()/release() directly; make those
+        # calls attempt-aware so a direct finish is deferred to publication
+        if self.attempt is not None and not isinstance(self.job, _AttemptBoundJob):
+            self.job = _AttemptBoundJob(self.job, self)
+        self._defer_job_finish = False
+        self._job_finish_requested = False
+
         try:
             # a dataset can have multiple owners, but the creator is the user
             # that actually queued the processor, so their config is relevant
@@ -129,7 +193,9 @@ class BasicProcessor(FourcatModule, BasicWorker, metaclass=abc.ABCMeta):
         except DataSetException:
             # query has been deleted in the meantime. finish without error,
             # as deleting it will have been a conscious choice by a user
-            self.job.finish()
+            if self.attempt is not None:
+                self.attempt.finalize(AttemptStatus.CANCELLED, error="dataset deleted before processing")
+            self.job.finish(attempt_id=self.attempt.id if self.attempt is not None else None)
             return
 
         # set up config reader wrapping the worker's config manager, which is
@@ -137,6 +203,79 @@ class BasicProcessor(FourcatModule, BasicWorker, metaclass=abc.ABCMeta):
         # originally loaded in bootstrap
         self.config = ConfigWrapper(config=self.config, user=User.get_by_name(self.db, self.owner))
 
+        # actions that must only run once publication is committed (external
+        # file copies, notification emails)
+        self._post_commit_actions = []
+        self._resuming_attempt = False
+
+        # reconcile a previous owner's non-terminal attempt (restart,
+        # uncertain commit, duplicate claim) before touching anything
+        if self.attempt is not None:
+            self._reconcile_attempt()
+
+        self._run_processor()
+
+    def _reconcile_attempt(self):
+        """
+        Adopt or supersede a previous non-terminal attempt for this job
+
+        A previous attempt that had already validated its candidate is
+        adopted: the claim is re-stamped with its ID and publication resumes
+        at the missing phase without running process()/external fetches again.
+        An attempt that died before validation cannot be proven complete and
+        is superseded; the current attempt re-runs safely in a fresh area.
+        """
+        prior = Attempt.get_prior_open(
+            self.job.data["jobtype"],
+            self.job.data["remote_id"],
+            self.attempt.id,
+            self.db,
+            self.modules,
+        )
+        if prior is None:
+            return
+
+        if prior.can_resume_without_reprocessing:
+            adopted = self.db.update(
+                "jobs",
+                data={"attempt_id": prior.id},
+                where={
+                    "jobtype": self.job.data["jobtype"],
+                    "remote_id": self.job.data["remote_id"],
+                    "attempt_id": self.attempt.id,
+                },
+            )
+            if adopted:
+                self.dataset.log(
+                    "Reconciling attempt %s: resuming publication from phase '%s' without reprocessing"
+                    % (prior.id, prior.phase)
+                )
+                self.attempt.finalize(
+                    AttemptStatus.SUPERSEDED,
+                    error="superseded by reconciliation; adopted %s at phase %s" % (prior.id, prior.phase),
+                )
+                prior.touch_heartbeat()
+                self.attempt = prior
+                self.job.data["attempt_id"] = prior.id
+                self._resuming_attempt = True
+                return
+
+        # candidate unprovable (or claim race lost): restart safely in the
+        # current attempt's fresh isolated area
+        self.dataset.log(
+            "Attempt %s stopped at phase '%s' before validation; superseding it and re-running safely"
+            % (prior.id, prior.phase)
+        )
+        prior.finalize(
+            AttemptStatus.SUPERSEDED,
+            error="superseded by %s after incomplete processing" % self.attempt.id,
+        )
+
+    def _run_processor(self):
+        """
+        Processor body within the attempt context (dataset paths redirected
+        to the isolated area; newly created datasets tagged as children)
+        """
         if self.dataset.data.get("key_parent", None):
             # search workers never have parents (for now), so we don't need to
             # find out what the source_dataset dataset is if it's a search worker
@@ -156,7 +295,9 @@ class BasicProcessor(FourcatModule, BasicWorker, metaclass=abc.ABCMeta):
                         # above this dataset. This should never occur, but if it does, we
                         # cannot continue
                         self.log.error(f"Processor preset {self.type} for dataset {self.dataset.key} cannot find non-preset parent dataset")
-                        self.job.finish()
+                        if self.attempt is not None:
+                            self.attempt.finalize(AttemptStatus.CANCELLED, error="preset without non-preset parent")
+                        self.job.finish(attempt_id=self.attempt.id if self.attempt is not None else None)
                         return
 
             except DataSetException:
@@ -164,104 +305,440 @@ class BasicProcessor(FourcatModule, BasicWorker, metaclass=abc.ABCMeta):
                 # analysis
                 self.log.warning("Processor %s queued for orphan dataset %s: cannot run, cancelling job" % (
                     self.type, self.dataset.key))
-                self.job.finish()
+                if self.attempt is not None:
+                    self.attempt.finalize(AttemptStatus.CANCELLED, error="orphaned dataset row")
+                self.job.finish(attempt_id=self.attempt.id if self.attempt is not None else None)
                 return
 
             if not self.source_dataset.is_finished() and not self.is_running_in_preset:
                 # not finished yet - retry after a while
                 # exception for presets, since these *should* be unfinished
                 # until underlying processors are done
-                self.job.release(delay=30)
+                self.job.release(delay=30, attempt_id=self.attempt.id if self.attempt is not None else None)
                 return
 
             self.source_file = self.source_dataset.get_results_path()
             if not self.source_file.exists():
                 self.dataset.update_status("Finished, no input data found.")
 
-        self.log.info("Running processor %s on dataset %s" % (self.type, self.job.data["remote_id"]))
+        if self.attempt is not None and not self._resuming_attempt:
+            # bind the input dataset version (and parameter snapshot) to this
+            # attempt; publication refuses to proceed if the input changed
+            input_datasets = [self.source_dataset] if self.source_dataset is not None else []
+            self.attempt.set_inputs(input_datasets, self.dataset.parameters)
 
-        processor_name = self.title if hasattr(self, "title") else self.type
-        self.dataset.clear_log()
-        self.dataset.log("Processing '%s' started for dataset %s" % (processor_name, self.dataset.key))
+        # The dataset is only claimed once processing actually starts: a
+        # released "source not ready" wait must not tag/hide its row, and an
+        # adopted (resumed) attempt may already have files at the published
+        # paths, so it is bound without quarantining.
+        if self.attempt is not None:
+            self.dataset.bind_attempt(self.attempt, quarantine=not self._resuming_attempt)
 
-        # start log file; update dataset status_type to processing
-        self.dataset.update_status("Processing data", status_type=StatusType.PROCESSING)
-        self.dataset.update_version(get_software_commit(self))
+        attempt_context = DataSet.attempt_context(self.attempt) if self.attempt is not None \
+            else contextlib.nullcontext()
 
-        # we may create temporary files with the processor; anything in here
-        # will be deleted after the processor ends (or crashes!). dataset
-        # objects will have their cleanup methods called
-        self.for_cleanup = [self.dataset]
+        with attempt_context:
+            if self._resuming_attempt:
+                self.dataset.update_status("Completing publication after restart...")
+
+            self.log.info("Running processor %s on dataset %s" % (self.type, self.job.data["remote_id"]))
+
+            processor_name = self.title if hasattr(self, "title") else self.type
+            if not self._resuming_attempt:
+                self.dataset.clear_log()
+                self.dataset.log("Processing '%s' started for dataset %s" % (processor_name, self.dataset.key))
+
+            # start log file; update dataset status_type to processing
+            self.dataset.update_status("Processing data", status_type=StatusType.PROCESSING)
+            self.dataset.update_version(get_software_commit(self))
+
+            # we may create temporary files with the processor; anything in here
+            # will be deleted after the processor ends (or crashes!). dataset
+            # objects will have their cleanup methods called
+            self.for_cleanup = [self.dataset]
+            if self.source_dataset is not None:
+                # Add source dataset to cleanup list to remove disposable files
+                self.for_cleanup.append(self.source_dataset)
+
+            # get parameters
+            # if possible, fill defaults where parameters are not provided
+            given_parameters = self.dataset.parameters.copy()
+            all_parameters = self.get_options(self.source_dataset, config=self.config)
+            self.parameters = {
+                param: given_parameters.get(param, all_parameters.get(param, {}).get("default"))
+                for param in [*all_parameters.keys(), *given_parameters.keys()]
+            }
+
+            # now the parameters have been loaded into memory, clear any sensitive
+            # ones. This has a side-effect that a processor may not run again
+            # without starting from scratch, but this is the price of progress
+            options = self.get_options(self.dataset.get_parent(), config=self.config)
+            for option, option_settings in options.items():
+                if option_settings.get("sensitive"):
+                    self.dataset.delete_parameter(option)
+
+            if self.interrupted:
+                self.dataset.log("Processing interrupted, trying again later")
+                return self.abort()
+
+            if not self.dataset.is_finished():
+                try:
+                    if self._resuming_attempt:
+                        # adopted a crashed attempt past validation: run only the
+                        # missing publication phases; process() and external
+                        # fetches are never executed again
+                        self._publish_attempt()
+                    else:
+                        if self.attempt is not None:
+                            self.attempt.transition(phase=AttemptPhase.PROCESSING)
+
+                        # direct self.job.finish() calls from the processor
+                        # body are deferred until publication
+                        self._defer_job_finish = True
+                        try:
+                            self.process()
+                            self.after_process()
+                        finally:
+                            self._defer_job_finish = False
+
+                        if self.attempt is not None:
+                            # validate staged candidates, atomically move files,
+                            # commit dataset/child/job state in one transaction
+                            self._publish_attempt()
+                        elif not self.job.is_finished:
+                            # processors should usually finish their jobs by
+                            # themselves, but if the worker finished without errors
+                            # and there is no attempt, the job can be finished in
+                            # any case
+                            self.job.finish()
+                except WorkerInterruptedException as e:
+                    self.dataset.log("Processing interrupted: %s" % str(e))
+                    self.dataset.update_status("Processing interrupted, trying again later", status_type=StatusType.QUEUED)
+                    self.abort()
+                except LostArbitrationException as e:
+                    # a newer attempt/cancel owns the job now: stop quietly, no
+                    # post-publication side effects, no crash park loop
+                    self.log.warning("Processor %s lost attempt arbitration for %s: %s" % (
+                        self.type, self.dataset.key, str(e)))
+                except Exception as e:
+                    self.dataset.log("Processor crashed: %s" % str(e))
+                    self.dataset.update_status("Processor error, trying again later", status_type=StatusType.QUEUED)
+                    stack = traceback.extract_tb(e.__traceback__)
+                    frames = [frame.filename.split("/").pop() + ":" + str(frame.lineno) for frame in stack[1:]]
+                    location = "->".join(frames)
+
+                    # Not all datasets have source_dataset keys
+                    if len(self.dataset.get_genealogy()) > 1:
+                        parent_key = " (via " + self.dataset.get_genealogy()[0].key + ")"
+                    else:
+                        parent_key = ""
+
+                    # Clean up partially created datasets/files
+                    self.clean_up_on_error()
+
+                    validation_failed = isinstance(e, ResultValidationError)
+                    if self.attempt is not None:
+                        self.attempt.finalize(
+                            AttemptStatus.FAILED,
+                            # a late worker cannot flip a committed attempt;
+                            # finalize() is conditional and simply no-ops then
+                            error=("validation: %s" % str(e)) if validation_failed else str(e),
+                        )
+
+                    raise ProcessorException("Processor %s raised %s while processing dataset %s%s in %s:\n   %s\n" % (
+                        self.type, e.__class__.__name__, self.dataset.key, parent_key, location, str(e)), frame=stack)
+
+                finally:
+                    # clean up files that have been created and marked as disposable
+                    for item in self.for_cleanup:
+                        if type(item) is DataSet:
+                            item.remove_disposable_files()
+                        elif item.exists():
+                            shutil.rmtree(item, ignore_errors=True)
+            else:
+                # dataset already finished, job shouldn't be open anymore
+                self.log.warning("Job %s/%s was queued for a dataset already marked as finished, deleting..." % (
+                self.job.data["jobtype"], self.job.data["remote_id"]))
+                if self.attempt is not None:
+                    self.attempt.finalize(AttemptStatus.COMMITTED, error="dataset already finished")
+                self.job.finish(attempt_id=self.attempt.id if self.attempt is not None else None)
+
+    def finish_job(self):
+        """
+        Finish the job, deferring the actual row deletion until an attempt's
+        publication transaction is committed
+
+        Without an attempt (e.g. workers constructed outside the delegator)
+        this behaves exactly like `self.job.finish()`.
+        """
+        if self.attempt is None:
+            return self.job.finish()
+        # the publication gate finishes the job conditionally itself
+        return True
+
+    def defer_after_commit(self, action):
+        """
+        Run `action` immediately when no attempt is active, otherwise after
+        the attempt publication commits (used for external side effects such
+        as copy_to and notification e-mails)
+        """
+        if self.attempt is None:
+            return action()
+        self._post_commit_actions.append(action)
+
+    def _run_post_commit_actions(self):
+        for action in self._post_commit_actions:
+            try:
+                action()
+            except Exception as e:
+                # publication itself already succeeded; never fail the job
+                # over a follow-up side effect
+                self.log.error("Post-publication action failed for %s: %s" % (self.dataset.key, e))
+        self._post_commit_actions = []
+
+    def _publish_attempt(self):
+        """
+        Validate staged outputs and publish everything of this attempt as one
+
+        Order (each boundary is a durable attempt checkpoint so a crash can be
+        reconciled and resumed at the missing phase):
+
+        1. verify input signature and validate candidates (format, row count,
+           referenced resources), assemble the manifest
+        2. checkpoint FILES_PUBLISHED, then atomically os.replace files and
+           resource folders to their published locations
+        3. one DB transaction under an advisory lock: terminal dataset
+           states, child visibility, buffered child jobs and the committed
+           attempt row
+        4. conditionally finish the job, then run post-commit side effects
+        """
+        attempt = self.attempt
+
         if self.source_dataset is not None:
-            # Add source dataset to cleanup list to remove disposable files
-            self.for_cleanup.append(self.source_dataset)
+            ok, changed = attempt.verify_inputs([self.source_dataset], self.dataset.parameters)
+            if not ok:
+                raise ResultValidationError("Input dataset changed during processing: %s" % "; ".join(changed))
 
-        # get parameters
-        # if possible, fill defaults where parameters are not provided
-        given_parameters = self.dataset.parameters.copy()
-        all_parameters = self.get_options(self.source_dataset, config=self.config)
-        self.parameters = {
-            param: given_parameters.get(param, all_parameters.get(param, {}).get("default"))
-            for param in [*all_parameters.keys(), *given_parameters.keys()]
+        owned_rows = self.db.fetchall("SELECT * FROM datasets WHERE attempt_id = %s", (attempt.id,))
+        manifest = attempt.get_manifest()
+        pending = attempt.get_pending_finishes()
+        consumed = set(manifest.get("consumed_results", []))
+        count_zip_entries = set(manifest.get("count_archive_entries", []))
+
+        # prior checkpoint entries (resumed attempt after a crash mid-publish)
+        prior_by_name = {
+            Path(entry["path"]).name: entry for entry in manifest.get("results", []) if entry.get("path")
         }
 
-        # now the parameters have been loaded into memory, clear any sensitive
-        # ones. This has a side-effect that a processor may not run again
-        # without starting from scratch, but this is the price of progress
-        options = self.get_options(self.dataset.get_parent(), config=self.config)
-        for option, option_settings in options.items():
-            if option_settings.get("sensitive"):
-                self.dataset.delete_parameter(option)
+        result_moves = []
+        folder_entries = []
+        for row in owned_rows:
+            key = row["key"]
+            if key not in pending:
+                # tagged but not finalised by this attempt (e.g. a preset's
+                # own dataset stays open until its pipeline attaches)
+                continue
 
-        if self.interrupted:
-            self.dataset.log("Processing interrupted, trying again later")
-            return self.abort()
+            target = DataSet(data=dict(row), db=self.db, modules=self.modules, check_owners=False)
+            target._attempt = attempt
+            planned = pending[key]
+            # the planned result file may differ from the reserved DB name
+            # (e.g. an attach surrogate adopts another extension)
+            logical = target._get_logical_results_path().parent.joinpath(
+                planned.get("result_file") or target.data["result_file"]
+            )
+            candidate = attempt.candidate_result_path(logical)
 
-        if not self.dataset.is_finished():
-            try:
-                self.process()
-                self.after_process()
-                
-                # processors should usually finish their jobs by themselves, but if
-                # the worker finished without errors, the job can be finished in
-                # any case
-                if not self.job.is_finished:
-                    self.job.finish()
-            except WorkerInterruptedException as e:
-                self.dataset.log("Processing interrupted: %s" % str(e))
-                self.dataset.update_status("Processing interrupted, trying again later", status_type=StatusType.QUEUED)
-                self.abort()
-            except Exception as e:
-                self.dataset.log("Processor crashed: %s" % str(e))
-                self.dataset.update_status("Processor error, trying again later", status_type=StatusType.QUEUED)
-                stack = traceback.extract_tb(e.__traceback__)
-                frames = [frame.filename.split("/").pop() + ":" + str(frame.lineno) for frame in stack[1:]]
-                location = "->".join(frames)
-
-                # Not all datasets have source_dataset keys
-                if len(self.dataset.get_genealogy()) > 1:
-                    parent_key = " (via " + self.dataset.get_genealogy()[0].key + ")"
+            if planned["num_rows"] > 0 and key not in consumed:
+                if candidate.exists():
+                    entry = build_candidate_manifest_entry(
+                        candidate,
+                        attempt.root_dir,
+                        num_rows=planned["num_rows"],
+                        count_archive_entries=key in count_zip_entries,
+                    )
+                    entry["key"] = key
+                    result_moves.append((target, entry, candidate, logical))
+                elif logical.exists():
+                    # a previous owner already published the files but did not
+                    # commit: prove the published bytes are the validated ones
+                    prior_entry = prior_by_name.get(logical.name)
+                    if prior_entry is not None:
+                        size = logical.stat().st_size
+                        digest = hash_file(logical)
+                        if size != prior_entry["size"] or digest != prior_entry["sha256"]:
+                            raise ResultValidationError(
+                                "Published result %s differs from the validated candidate" % logical.name
+                            )
+                    entry = {
+                        "path": "result/" + logical.name,
+                        "size": logical.stat().st_size,
+                        "sha256": hash_file(logical),
+                        "entries": prior_entry["entries"] if prior_entry else None,
+                        "declared_rows": planned["num_rows"],
+                        "key": key,
+                        "already_published": True,
+                    }
+                    result_moves.append((target, entry, None, logical))
                 else:
-                    parent_key = ""
-                
-                # Clean up partially created datasets/files
-                self.clean_up_on_error()
+                    raise ResultValidationError(
+                        "Neither staged candidate nor published result exists for dataset %s" % key
+                    )
 
-                raise ProcessorException("Processor %s raised %s while processing dataset %s%s in %s:\n   %s\n" % (
-                    self.type, e.__class__.__name__, self.dataset.key, parent_key, location, str(e)), frame=stack)
+            candidate_folder = target.get_results_folder_path()
+            logical_folder = logical.parent.joinpath("folder_" + key)
+            if candidate_folder.exists():
+                folder_entry = describe_files_folder(candidate_folder, attempt.root_dir)
+                folder_entry["key"] = key
+                folder_entry["already_published"] = False
+                folder_entries.append(folder_entry)
+            elif logical_folder.exists():
+                folder_entries.append({
+                    "path": logical_folder.name,
+                    "files": sorted(str(relative) for relative in logical_folder.rglob("*")
+                                    if relative.is_file()),
+                    "key": key,
+                    "already_published": True,
+                })
 
-            finally:
-                # clean up files that have been created and marked as disposable
-                for item in self.for_cleanup:
-                    if type(item) is DataSet:
-                        item.remove_disposable_files()
-                    elif item.exists():
-                        shutil.rmtree(item, ignore_errors=True)
+        publication_manifest = {
+            **manifest,
+            "results": [entry for _, entry, _, _ in result_moves],
+            "folders": folder_entries,
+        }
+        if not phase_at_least(attempt.phase, AttemptPhase.VALIDATED):
+            attempt.transition(phase=AttemptPhase.VALIDATED, status=AttemptStatus.PUBLISHING,
+                               manifest=publication_manifest)
         else:
-            # dataset already finished, job shouldn't be open anymore
-            self.log.warning("Job %s/%s was queued for a dataset already marked as finished, deleting..." % (
-            self.job.data["jobtype"], self.job.data["remote_id"]))
-            self.job.finish()
+            # reconciliation: refresh the manifest without moving a checkpoint
+            # backwards
+            attempt.transition(manifest=publication_manifest)
+
+        # best-effort ownership check before touching published paths; the
+        # authoritative check is the row-conditional update inside the
+        # publication transaction
+        current = self.db.fetchone(
+            "SELECT attempt_id FROM jobs WHERE jobtype = %s AND remote_id = %s",
+            (self.job.data["jobtype"], self.job.data["remote_id"]),
+        )
+        if not current or current["attempt_id"] != attempt.id:
+            raise LostArbitrationException(
+                "Job %s/%s is no longer owned by attempt %s before publication"
+                % (self.job.data["jobtype"], self.job.data["remote_id"], attempt.id)
+            )
+
+        # checkpoint before moving: crashing after this re-does only the moves
+        # and DB commit, never process(); crashing before it re-runs safely
+        if not phase_at_least(attempt.phase, AttemptPhase.FILES_PUBLISHED):
+            attempt.transition(phase=AttemptPhase.FILES_PUBLISHED)
+
+        for _, entry, candidate, logical in result_moves:
+            if entry.get("already_published"):
+                # reconciliation: a previous owner already moved the file
+                continue
+            fsync_path(candidate)
+            logical.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(candidate, logical)
+
+        for folder_entry in folder_entries:
+            if folder_entry.get("already_published"):
+                continue
+            source = attempt.root_dir.joinpath(folder_entry["path"])
+            destination = attempt.get_path_data().joinpath(source.name)
+            if source.exists() and not destination.exists():
+                os.replace(source, destination)
+
+        for _, entry, _, logical in result_moves:
+            if not logical.is_file() or logical.stat().st_size != entry["size"]:
+                raise ResultValidationError(
+                    "Published result %s is missing or incomplete after file move" % logical.name
+                )
+
+        # single atomic database publication
+        try:
+            self.db.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s), hashtext(%s))",
+                (self.job.data["jobtype"], self.job.data["remote_id"]),
+                commit=False,
+            )
+            current = self.db.fetchone(
+                "SELECT attempt_id FROM jobs WHERE jobtype = %s AND remote_id = %s",
+                (self.job.data["jobtype"], self.job.data["remote_id"]),
+            )
+            if not current or current["attempt_id"] != attempt.id:
+                raise LostArbitrationException(
+                    "Job %s/%s is no longer owned by attempt %s"
+                    % (self.job.data["jobtype"], self.job.data["remote_id"], attempt.id)
+                )
+
+            # take a row lock on the job for the rest of the transaction so
+            # cancellation/deletion cannot win while we commit results
+            job_where = {
+                "jobtype": self.job.data["jobtype"],
+                "remote_id": self.job.data["remote_id"],
+                "attempt_id": attempt.id,
+            }
+            if self.job.is_recurring:
+                locked = self.db.update(
+                    "jobs",
+                    data={"timestamp_claimed": 0, "attempts": 0, "attempt_id": ""},
+                    where=job_where,
+                    commit=False,
+                )
+            else:
+                locked = self.db.delete("jobs", where=job_where, commit=False)
+            if not locked:
+                raise LostArbitrationException(
+                    "Job row %s/%s vanished during publication of %s"
+                    % (self.job.data["jobtype"], self.job.data["remote_id"], attempt.id)
+                )
+
+            finished_at = int(time.time())
+            for key, planned in pending.items():
+                data = {
+                    "is_finished": True,
+                    "num_rows": planned["num_rows"],
+                    "progress": 1.0,
+                    "status_type": planned["status_type"],
+                    "timestamp_finished": finished_at,
+                }
+                row_file = next((row["result_file"] for row in owned_rows if row["key"] == key), None)
+                if row_file is not None and row_file != planned["result_file"]:
+                    data["result_file"] = planned["result_file"]
+                self.db.update("datasets", data=data, where={"key": key}, commit=False)
+
+            # children visible, their jobs claimable, and this attempt is
+            # committed, all in the same transaction
+            attempt.publish_dataset_tags(commit=False)
+            attempt.flush_pending_children(commit=False)
+            attempt.transition(phase=AttemptPhase.DB_COMMITTED, commit=False)
+            if not attempt.finalize(AttemptStatus.COMMITTED, commit=False):
+                raise LostArbitrationException(
+                    "Attempt %s was already finalised by another owner" % attempt.id
+                )
+            self.db.commit()
+        except LostArbitrationException:
+            try:
+                self.db.rollback()
+            except Exception:
+                pass
+            raise
+        except Exception:
+            self.db.rollback()
+            # files may already be published; reconciliation resumes here
+            raise
+
+        # the job row was deleted (one-shot) or reset (recurring) inside the
+        # transaction, conditionally on attempt ownership
+        self.job.is_finished = True
+
+        attempt.transition(phase=AttemptPhase.JOB_FINISHED)
+
+        # reflect the committed state on the live instance
+        self.dataset.data["attempt_id"] = ""
+        self.dataset._attempt = None
+
+        self._run_post_commit_actions()
 
     def after_process(self):
         """
@@ -341,14 +818,20 @@ class BasicProcessor(FourcatModule, BasicWorker, metaclass=abc.ABCMeta):
 
         # see if we need to register the result somewhere
         if "copy_to" in self.parameters:
-            # copy the results to an arbitrary place that was passed
-            if self.dataset.get_results_path().exists():
-                shutil.copyfile(str(self.dataset.get_results_path()), self.parameters["copy_to"])
-            else:
-                # if copy_to was passed, that means it's important that this
-                # file exists somewhere, so we create it as an empty file
-                with open(self.parameters["copy_to"], "w") as empty_file:
-                    empty_file.write("")
+            # copy the results to an arbitrary place that was passed.
+            # external side effect: under an attempt, run only after the
+            # result has been atomically published
+            def _copy_result(dataset=self.dataset, destination=self.parameters["copy_to"]):
+                source = dataset.get_results_path()
+                if source.exists():
+                    shutil.copyfile(str(source), destination)
+                else:
+                    # if copy_to was passed, that means it's important that this
+                    # file exists somewhere, so we create it as an empty file
+                    with open(destination, "w") as empty_file:
+                        empty_file.write("")
+
+            self.defer_after_commit(_copy_result)
 
         # see if this query chain is to be attached to another query
         # if so, the full genealogy of this query (minus the original dataset)
@@ -359,10 +842,15 @@ class BasicProcessor(FourcatModule, BasicWorker, metaclass=abc.ABCMeta):
                 # copy metadata and results to the surrogate
                 surrogate = DataSet(key=self.parameters["attach_to"], db=self.db, modules=self.modules)
 
+                if self.attempt is not None and not surrogate.is_finished():
+                    # the surrogate is published together with this attempt;
+                    # its result is staged in the same isolated area
+                    surrogate.bind_attempt(self.attempt)
+
                 if self.dataset.get_results_path().exists():
                     # Update the surrogate's results file suffix to match this dataset's suffix
                     surrogate.data["result_file"] = surrogate.get_results_path().with_suffix(
-                        self.dataset.get_results_path().suffix)
+                        self.dataset.get_results_path().suffix).name
                     shutil.copyfile(str(self.dataset.get_results_path()), str(surrogate.get_results_path()))
 
                 try:
@@ -384,52 +872,75 @@ class BasicProcessor(FourcatModule, BasicWorker, metaclass=abc.ABCMeta):
         # don't re-alert.
         self._validate_map_item_post_run()
 
-        self.job.finish()
+        self.finish_job()
 
         if self.config.get('mail.server') and self.dataset.get_parameters().get("email-complete", False):
             owner = self.dataset.get_parameters().get("email-complete", False)
             # Check that username is email address
             if looks_like_email_address(owner):
-                from email.mime.multipart import MIMEMultipart
-                from email.mime.text import MIMEText
-                from smtplib import SMTPException
-                import socket
-                import html2text
+                def _send_completion_email(owner=owner):
+                    from email.mime.multipart import MIMEMultipart
+                    from email.mime.text import MIMEText
+                    from smtplib import SMTPException
+                    import socket
+                    import html2text
 
-                self.log.debug("Sending email to %s" % owner)
-                dataset_url = ('https://' if self.config.get('flask.https') else 'http://') + self.config.get('flask.server_name') + '/results/' + self.dataset.key
-                sender = self.config.get('mail.noreply')
-                message = MIMEMultipart("alternative")
-                message["From"] = sender
-                message["To"] = owner
-                message["Subject"] = "4CAT dataset completed: %s - %s" % (self.dataset.type, self.dataset.get_label())
-                mail = """
-                    <p>Hello %s,</p>
-                    <p>4CAT has finished collecting your %s dataset labeled: %s</p>
-                    <p>You can view your dataset via the following link:</p>
-                    <p><a href="%s">%s</a></p> 
-                    <p>Sincerely,</p>
-                    <p>Your friendly neighborhood 4CAT admin</p>
-                    """ % (owner, self.dataset.type, self.dataset.get_label(), dataset_url, dataset_url)
-                html_parser = html2text.HTML2Text()
-                message.attach(MIMEText(html_parser.handle(mail), "plain"))
-                message.attach(MIMEText(mail, "html"))
-                try:
-                    send_email([owner], message, self.config)
-                except (SMTPException, ConnectionRefusedError, socket.timeout):
-                    self.log.error("Error sending email to %s" % owner)
+                    self.log.debug("Sending email to %s" % owner)
+                    dataset_url = ('https://' if self.config.get('flask.https') else 'http://') + \
+                                  self.config.get('flask.server_name') + '/results/' + self.dataset.key
+                    sender = self.config.get('mail.noreply')
+                    message = MIMEMultipart("alternative")
+                    message["From"] = sender
+                    message["To"] = owner
+                    message["Subject"] = "4CAT dataset completed: %s - %s" % (
+                        self.dataset.type, self.dataset.get_label())
+                    mail = """
+                        <p>Hello %s,</p>
+                        <p>4CAT has finished collecting your %s dataset labeled: %s</p>
+                        <p>You can view your dataset via the following link:</p>
+                        <p><a href="%s">%s</a></p>
+                        <p>Sincerely,</p>
+                        <p>Your friendly neighborhood 4CAT admin</p>
+                        """ % (owner, self.dataset.type, self.dataset.get_label(), dataset_url, dataset_url)
+                    html_parser = html2text.HTML2Text()
+                    message.attach(MIMEText(html_parser.handle(mail), "plain"))
+                    message.attach(MIMEText(mail, "html"))
+                    try:
+                        send_email([owner], message, self.config)
+                    except (SMTPException, ConnectionRefusedError, socket.timeout):
+                        self.log.error("Error sending email to %s" % owner)
+
+                self.defer_after_commit(_send_completion_email)
 
     def clean_up_on_error(self):
         try:
             # ensure proxied requests are stopped
             self.flush_proxied_requests()
-            # delete annotations that have been generated as part of this processor
-            self.db.delete("annotations", where={"from_dataset": self.dataset.key}, commit=True)
-            # Remove the results file that was created
+            if self.attempt is not None:
+                # only remove annotations created during this attempt: a
+                # late cleanup after a re-run must never delete rows a newer
+                # attempt already wrote (small upper margin for rows written
+                # just after the last heartbeat)
+                self.db.execute(
+                    "DELETE FROM annotations WHERE from_dataset = %s AND timestamp >= %s AND timestamp <= %s",
+                    (self.dataset.key, self.attempt.data["timestamp_created"],
+                     self.attempt.data["heartbeat_at"] + 600),
+                )
+            else:
+                # delete annotations that have been generated as part of this processor
+                self.db.delete("annotations", where={"from_dataset": self.dataset.key}, commit=True)
+            # Remove the staged results file (attempt-aware path: the
+            # published path has never been touched)
             if self.dataset.get_results_path().exists():
                 self.dataset.get_results_path().unlink()
             if self.dataset.get_results_folder_path().exists():
                 shutil.rmtree(self.dataset.get_results_folder_path())
+
+            if self.attempt is not None:
+                # discard child datasets/buffered jobs created by this failed
+                # attempt; pre-existing rows (this dataset, attach surrogates)
+                # are only untagged so they can be retried
+                self.attempt.discard_owned_datasets()
 
         except Exception as e:
             self.log.error("Error during processor cleanup after error: %s" % str(e))
@@ -440,16 +951,21 @@ class BasicProcessor(FourcatModule, BasicWorker, metaclass=abc.ABCMeta):
         """
         self.clean_up_on_error()
 
+        attempt_id = self.attempt.id if self.attempt is not None else None
+
         # we release instead of finish, since interrupting is just that - the
         # job should resume at a later point. Delay resuming by 10 seconds to
         # give 4CAT the time to do whatever it wants (though usually this isn't
         # needed since restarting also stops the spawning of new workers)
         if self.interrupted == self.INTERRUPT_RETRY:
             # retry later - wait at least 10 seconds to give the backend time to shut down
-            self.job.release(delay=10)
+            self.job.release(delay=10, attempt_id=attempt_id)
+            # the open attempt is reconciled/superseded when the job is reclaimed
         elif self.interrupted == self.INTERRUPT_CANCEL:
             # cancel job
-            self.job.finish()
+            if self.attempt is not None:
+                self.attempt.finalize(AttemptStatus.CANCELLED)
+            self.job.finish(attempt_id=attempt_id)
 
     def iterate_proxied_requests(self, urls, preserve_order=True, **kwargs):
         """
@@ -679,6 +1195,10 @@ class BasicProcessor(FourcatModule, BasicWorker, metaclass=abc.ABCMeta):
         if num_items is None:
             num_items = done
 
+        # framework-produced archive: one member per declared row
+        if self.attempt is not None:
+            self.attempt.mark_archive_entries(self.dataset.key)
+
         if finish and not warning:
             self.dataset.update_status("Finished")
             self.dataset.finish(num_items)
@@ -763,9 +1283,11 @@ class BasicProcessor(FourcatModule, BasicWorker, metaclass=abc.ABCMeta):
 
         self.dataset.copied_to = standalone.key
 
-        # we don't need this file anymore - it has been copied to the new
-        # standalone dataset, and this one is not accessible via the interface
+        # we don't need this file anymore - the copied standalone dataset, and
+        # this one is not accessible via the interface
         # except as a link to the copied standalone dataset
+        # tell the attempt not to expect a candidate for this intermediate
+        self.dataset.mark_result_consumed()
         os.unlink(self.dataset.get_results_path())
 
         # Copy the log

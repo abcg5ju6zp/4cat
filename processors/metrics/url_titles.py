@@ -143,6 +143,7 @@ class URLFetcher(BasicProcessor):
             self.writer.writeheader()
             urls_failed = 0
             urls_success = 0
+            rows_written = 0
 
             ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:123.0) Gecko/20100101 Firefox/123.0"
 
@@ -181,17 +182,19 @@ class URLFetcher(BasicProcessor):
                             "reason": response.reason,
                             "title": response.page_title
                         })
+                        rows_written += 1
 
                 self.dataset.update_status(f"Processed {(urls_failed + urls_success):,} of {len(all_urls):,} URLs")
                 self.dataset.update_progress((urls_failed + urls_success) / len(all_urls))
 
-        # and write everything to a CSV
+        # and write everything to a CSV; num_rows reflects CSV rows (one per
+        # item), not successful URLs (one URL can cover several items)
         if urls_failed:
             # log warning if not everything succeeded
-            self.dataset.finish_with_warning(urls_success, f"{urls_failed:,} URL(s) could not be retrieved. See dataset "
+            self.dataset.finish_with_warning(rows_written, f"{urls_failed:,} URL(s) could not be retrieved. See dataset "
                                        f"log for details.")
         else:
-            self.dataset.finish(urls_success)
+            self.dataset.finish(rows_written)
             self.job.finish()
 
     @staticmethod

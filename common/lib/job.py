@@ -36,6 +36,7 @@ class Job:
 		self.db = database
 
 		self.data["remote_id"] = str(self.data["remote_id"])
+		self.data.setdefault("attempt_id", "")
 
 		try:
 			self.is_finished = "is_finished" in self.data and self.data["is_finished"]
@@ -89,11 +90,17 @@ class Job:
 
 		return Job.get_by_data(data, database=database)
 
-	def claim(self):
+	def claim(self, attempt_id=""):
 		"""
 		Claim a job
 
-		This marks it in the database so it cannot be claimed again.
+		This marks it in the database so it cannot be claimed again. The
+		provided attempt ID is stamped in the same conditional UPDATE, so the
+		live attempt owner is recorded atomically with the claim; a lost claim
+		leaves it untouched.
+
+		:param str attempt_id:  Stable ID of the processing attempt this claim
+		  starts. Stored on the jobs row for conditional terminal writes.
 		"""
 		if not self.is_recurring:
 			claim_time = int(time.time())
@@ -103,19 +110,22 @@ class Job:
 			# the interval remains as set
 			claim_time = math.floor(int(time.time()) / self.data["interval"]) * self.data["interval"]
 
-		updated = self.db.update("jobs", data={"timestamp_claimed": claim_time, "timestamp_lastclaimed": claim_time},
-								 where={"jobtype": self.data["jobtype"], "remote_id": self.data["remote_id"],
-										"timestamp_claimed": 0})
+		updated = self.db.execute(
+			"UPDATE jobs SET timestamp_claimed = %s, timestamp_lastclaimed = %s, attempt_id = %s "
+			"WHERE jobtype = %s AND remote_id = %s AND timestamp_claimed = 0",
+			(claim_time, claim_time, attempt_id, self.data["jobtype"], self.data["remote_id"]),
+		)
 
 		if updated == 0:
 			raise JobClaimedException()
 
 		self.data["timestamp_claimed"] = claim_time
 		self.data["timestamp_lastclaimed"] = claim_time
+		self.data["attempt_id"] = attempt_id
 
 		self.is_claimed = True
 
-	def finish(self, delete=False):
+	def finish(self, delete=False, attempt_id=None):
 		"""
 		Finish job
 
@@ -124,16 +134,29 @@ class Job:
 
 		:param bool delete: Whether to force deleting the job even if it is a
 							job with an interval.
+		:param str attempt_id:  If given, only finish when the jobs row
+							currently carries this attempt ID. A return value
+							of False then means arbitration was lost (e.g. a
+							late worker completing a re-claimed job).
+		:return bool:  Whether the job row was actually finished by this call
 		"""
+		where = {"jobtype": self.data["jobtype"], "remote_id": self.data["remote_id"]}
+		if attempt_id is not None:
+			where["attempt_id"] = attempt_id
+
 		if not self.is_recurring or delete:
-			self.db.delete("jobs", where={"jobtype": self.data["jobtype"], "remote_id": self.data["remote_id"]})
+			affected = self.db.delete("jobs", where=where)
 		else:
-			self.db.update("jobs", data={"timestamp_claimed": 0, "attempts": 0},
-						   where={"jobtype": self.data["jobtype"], "remote_id": self.data["remote_id"]})
+			affected = self.db.update("jobs", data={"timestamp_claimed": 0, "attempts": 0, "attempt_id": ""},
+									  where=where)
+
+		if not affected:
+			return False
 
 		self.is_finished = True
+		return True
 
-	def release(self, delay=0, claim_after=0, increment_attempts=True):
+	def release(self, delay=0, claim_after=0, increment_attempts=True, attempt_id=None):
 		"""
 		Release a job so it may be claimed again
 
@@ -144,6 +167,9 @@ class Job:
 		attempt. True for soft failures/retries (the default, matching the
 		retry-budget logic in e.g. scraper.py); False for a deliberate re-queue
 		such as a manual retry, which is not itself a failure.
+		:param str attempt_id:  If given, only release when the jobs row
+		currently carries this attempt ID.
+		:return bool:  Whether the release applied (False = arbitration lost)
 		"""
 		update = {"timestamp_claimed": 0}
 		if increment_attempts:
@@ -157,11 +183,16 @@ class Job:
 		elif delay == 0:
 			update["timestamp_after"] = 0
 
-		self.db.update("jobs", data=update,
-					   where={"jobtype": self.data["jobtype"], "remote_id": self.data["remote_id"]})
-		self.is_claimed = False
+		where = {"jobtype": self.data["jobtype"], "remote_id": self.data["remote_id"]}
+		if attempt_id is not None:
+			where["attempt_id"] = attempt_id
 
-	def park(self):
+		applied = self.db.update("jobs", data=update, where=where)
+		if applied:
+			self.is_claimed = False
+		return (applied or 0) > 0
+
+	def park(self, attempt_id=None):
 		"""
 		Park a job after a crash
 
@@ -173,14 +204,26 @@ class Job:
 
 		`attempts` is incremented so the crash count survives restarts
 		(`release_all()` does not reset it).
+
+		:param str attempt_id:  If given, only park when the jobs row currently
+		carries this attempt ID.
+		:return bool:  Whether the park applied (False = arbitration lost)
 		"""
-		self.db.update("jobs",
+		where = {"jobtype": self.data["jobtype"], "remote_id": self.data["remote_id"]}
+		if attempt_id is not None:
+			where["attempt_id"] = attempt_id
+
+		applied = self.db.update("jobs",
 					   data={"timestamp_claimed": self.STATUS_PARKED, "attempts": self.data["attempts"] + 1},
-					   where={"jobtype": self.data["jobtype"], "remote_id": self.data["remote_id"]})
+					   where=where)
+		if not applied:
+			return False
+
 		self.data["timestamp_claimed"] = self.STATUS_PARKED
 		self.data["attempts"] = self.data["attempts"] + 1
 		self.is_claimed = False
 		self.is_parked = True
+		return True
 
 	@property
 	def is_recurring(self):

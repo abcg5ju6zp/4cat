@@ -1,4 +1,6 @@
 import collections
+import contextlib
+import contextvars
 import itertools
 import datetime
 import zipfile
@@ -32,6 +34,13 @@ class StatusType(Enum):
     EMPTY = "empty"
     WARNING = "warning"
     ERROR = "error"
+
+#: The attempt currently executing in this thread/context. DataSet rows
+#: created while an attempt is active are tagged as belonging to it, so their
+#: results are staged in the attempt's isolated area and only become visible
+#: at publication. Loaded (existing) datasets are never redirected by this
+#: alone: their row must be tagged with the same attempt ID.
+_active_attempt = contextvars.ContextVar("4cat_active_attempt", default=None)
 
 class DataSet(FourcatModule):
     """
@@ -70,6 +79,10 @@ class DataSet(FourcatModule):
     no_status_updates = False
     disposable_files = None
     _queue_position = None
+
+    #: Attempt this dataset instance is being processed by (None when the
+    #: dataset is not being written by an in-flight attempt)
+    _attempt = None
 
     def __init__(
             self,
@@ -125,6 +138,7 @@ class DataSet(FourcatModule):
         self._genealogy = None
         self.disposable_files = []
         self.modules = modules
+        self._attempt = None
 
         if key is not None:
             self.key = key
@@ -200,10 +214,20 @@ class DataSet(FourcatModule):
                 "num_rows": 0,
                 "progress": 0.0,
                 "key_parent": parent,
-                "annotation_fields": "{}"
+                "annotation_fields": "{}",
+                "attempt_id": ""
             }
             self.parameters = parameters
             self.annotation_fields = {}
+
+            # datasets created while an attempt is processing (next-chain
+            # children, standalone copies, preset pipelines) belong to it and
+            # are staged in its isolated area until publication
+            active = _active_attempt.get()
+            if active is not None:
+                self.data["attempt_id"] = active.id
+                self._attempt = active
+                active.note_new_dataset(self.key)
 
             self.db.insert("datasets", data=self.data)
             self.refresh_owners()
@@ -226,6 +250,99 @@ class DataSet(FourcatModule):
 
         if check_owners:
             self.refresh_owners()
+
+        # a loaded row that belongs to the attempt running in this context is
+        # redirected to the attempt area (e.g. surrogate datasets); input
+        # datasets are tagged for a different/no attempt and stay published
+        active = _active_attempt.get()
+        if self._attempt is None and active is not None and self.data.get("attempt_id") == active.id:
+            self._attempt = active
+
+    def _bound_attempt(self):
+        """
+        The attempt whose isolated area this dataset reads/writes through,
+        or None when its paths are the published ones
+
+        Besides an explicitly bound attempt (the dataset being executed), a
+        dataset row tagged with the context's active attempt ID is redirected
+        too (children/surrogates handled by the in-flight attempt). The
+        context is consulted dynamically so leaving `attempt_context()`
+        restores published paths without reloading the object.
+        """
+        if self._attempt is not None:
+            return self._attempt
+        active = _active_attempt.get()
+        if active is not None and self.data.get("attempt_id") == active.id:
+            return active
+        return None
+
+    @classmethod
+    @contextlib.contextmanager
+    def attempt_context(cls, attempt):
+        """
+        Run a block with `attempt` as the active attempt for datasets
+
+        Datasets created inside the block are tagged as belonging to the
+        attempt; datasets loaded with a matching tag are redirected to its
+        isolated area.
+        """
+        token = _active_attempt.set(attempt)
+        try:
+            yield attempt
+        finally:
+            _active_attempt.reset(token)
+
+    def bind_attempt(self, attempt, quarantine=True):
+        """
+        Bind an unfinished dataset to a processing attempt
+
+        Claims the dataset row for the attempt and moves any stale half
+        results already present at the published paths into quarantine, so no
+        partial file is observable while the attempt runs. The published
+        result path stays untouched from here until atomic publication.
+
+        :param Attempt attempt:
+        :param bool quarantine:  Move stale files at published paths into the
+        attempt's quarantine. Set False when reconciling an adopted attempt
+        whose files may already have been published to those paths.
+        """
+        if self.data.get("is_finished"):
+            return
+
+        self._attempt = attempt
+        attempt.ensure_dirs()
+
+        if self.data.get("attempt_id") != attempt.id:
+            self.db.update("datasets", data={"attempt_id": attempt.id}, where={"key": self.key})
+            self.data["attempt_id"] = attempt.id
+
+        quarantined = []
+        logical_result = self._get_logical_results_path()
+        if quarantine and logical_result.exists():
+            destination = self._unique_quarantine_path(attempt.quarantine_dir.joinpath(logical_result.name))
+            shutil.move(str(logical_result), str(destination))
+            quarantined.append({"kind": "result", "source": str(logical_result), "name": destination.name})
+
+        logical_folder = logical_result.parent.joinpath("folder_" + self.key)
+        if quarantine and logical_folder.exists():
+            destination = self._unique_quarantine_path(attempt.quarantine_dir.joinpath(logical_folder.name))
+            shutil.move(str(logical_folder), str(destination))
+            quarantined.append({"kind": "folder", "source": str(logical_folder), "name": destination.name})
+
+        if quarantined:
+            attempt.record_quarantine(self.key, quarantined)
+
+    @staticmethod
+    def _unique_quarantine_path(path):
+        """Return a non-existing path next to `path` (suffix -N on collision)"""
+        if not path.exists():
+            return path
+        index = 1
+        while True:
+            candidate = path.with_name("%s-%s" % (path.name, index))
+            if not candidate.exists():
+                return candidate
+            index += 1
 
     def check_dataset_finished(self):
         """
@@ -255,6 +372,22 @@ class DataSet(FourcatModule):
 
         :return Path:  A path to the results file
         """
+        logical = self._get_logical_results_path()
+        attempt = self._bound_attempt()
+        if attempt is not None:
+            return attempt.candidate_result_path(logical)
+        return logical
+
+    def _get_logical_results_path(self):
+        """
+        Get the published path to the results file, ignoring attempt binding
+
+        This is the path readers and downloads use once a dataset is
+        published; during an attempt the live result path points inside the
+        attempt's isolated area instead.
+
+        :return Path:  The logical (published) results file path
+        """
         # alas we need to instantiate a config reader here - no way around it
         if not self.folder:
             self.folder = self.modules.config.get('PATH_DATA')
@@ -264,11 +397,16 @@ class DataSet(FourcatModule):
         """
         Get path to folder containing accompanying results
 
-        Returns a path that may not yet be created
+        Returns a path that may not yet be created. While the dataset is
+        bound to an in-flight attempt this points inside the attempt's
+        isolated files directory.
 
-        :return Path:  A path to the results file
+        :return Path:  A path to the results folder
         """
-        return self.get_results_path().parent.joinpath("folder_" + self.key)
+        attempt = self._bound_attempt()
+        if attempt is not None:
+            return attempt.candidate_files_path(self.key)
+        return self._get_logical_results_path().parent.joinpath("folder_" + self.key)
 
     def get_log_path(self):
         """
@@ -278,9 +416,9 @@ class DataSet(FourcatModule):
         method returns the path to that file. It is identical to the path of
         the dataset result file, with 'log' as its extension instead.
 
-        :return Path:  A path to the log file
+        :return Path:  Path to the log file
         """
-        return self.get_results_path().with_suffix(".log")
+        return self._get_logical_results_path().with_suffix(".log")
 
     def clear_log(self):
         """
@@ -909,26 +1047,33 @@ class DataSet(FourcatModule):
 
         :return Path:  Path to folder
         """
-        results_file = self.get_results_path()
+        # base the staging name on the logical result file even while an
+        # attempt redirects writes, so legacy naming is preserved after publish
+        results_dir = self._get_logical_results_path().name.replace(".", "") + "-staging"
 
-        results_dir_base = results_file.parent
-        results_dir = results_file.name.replace(".", "") + "-staging"
+        attempt = self._bound_attempt()
+        if attempt is not None:
+            # isolated inside the attempt area; unique-named like the legacy
+            # `<result>-staging[-N]` scheme
+            results_path = attempt.candidate_staging_path(results_dir)
+        else:
+            results_dir_base = self._get_logical_results_path().parent
 
-        index = 1
-        # Try creating the staging directory; if a concurrent process created
-        # it between the exists() check and mkdir(), handle the EEXIST error
-        # by incrementing the index and retrying to avoid race conditions.
-        while True:
-            suffix = "" if index == 1 else f"-{index}"
-            results_path = results_dir_base.joinpath(results_dir + suffix)
-            try:
-                results_path.mkdir()
-                break
-            except OSError as e:
-                if getattr(e, 'errno', None) == errno.EEXIST:
-                    index += 1
-                    continue
-                raise
+            index = 1
+            # Try creating the staging directory; if a concurrent process created
+            # it between the exists() check and mkdir(), handle the EEXIST error
+            # by incrementing the index and retrying to avoid race conditions.
+            while True:
+                suffix = "" if index == 1 else f"-{index}"
+                results_path = results_dir_base.joinpath(results_dir + suffix)
+                try:
+                    results_path.mkdir()
+                    break
+                except OSError as e:
+                    if getattr(e, 'errno', None) == errno.EEXIST:
+                        index += 1
+                        continue
+                    raise
 
         # Storing the staging area with the dataset so that it can be removed later
         self.disposable_files.append(results_path)
@@ -994,6 +1139,13 @@ class DataSet(FourcatModule):
         """
         Declare the dataset finished
 
+        While the dataset belongs to an in-flight attempt this does not
+        commit the terminal state yet: it records the intended terminal
+        state in the attempt's manifest and applies it locally, so
+        `after_process()` behaves as before. The terminal UPDATE, file
+        publication and child visibility happen together in the attempt's
+        atomic publication (see BasicProcessor._publish_attempt).
+
         :param int num_rows:  Number of rows in the dataset
         :param StatusType status_type:  Status type to set the dataset to.
           If omitted, set to SUCCESS if num_rows > 0, else EMPTY
@@ -1001,11 +1153,23 @@ class DataSet(FourcatModule):
         # Without this guard, a second finish() silently overwrites status_type (e.g. WARNING → SUCCESS).
         if self.data["is_finished"]:
             raise RuntimeError("Cannot finish a finished dataset again")
-        
+
         if status_type is None:
             status_type = StatusType.SUCCESS if num_rows > 0 else StatusType.EMPTY
         elif not isinstance(status_type, StatusType):
             raise ValueError("status_type must be a StatusType enum value")
+
+        attempt = self._bound_attempt()
+        if attempt is not None and self.data.get("attempt_id") == attempt.id:
+            # defer the terminal commit to the atomic publication
+            attempt.record_pending_finish(
+                self.key, num_rows, status_type.value, self.data.get("result_file", "")
+            )
+            self.data["is_finished"] = True
+            self.data["num_rows"] = num_rows
+            self.data["status_type"] = status_type.value
+            self.data["progress"] = 1.0
+            return
 
         self.db.update(
             "datasets",
@@ -1021,6 +1185,17 @@ class DataSet(FourcatModule):
         self.data["is_finished"] = True
         self.data["num_rows"] = num_rows
         self.data["status_type"] = status_type.value
+
+    def mark_result_consumed(self):
+        """
+        Record that this dataset's own result file was intentionally removed
+        within the attempt (e.g. a filter intermediate replaced by a
+        standalone copy). The publication gate then does not require a
+        candidate file for it.
+        """
+        attempt = self._bound_attempt()
+        if attempt is not None and self.data.get("attempt_id") == attempt.id:
+            attempt.mark_result_consumed(self.key)
 
     def copy(self, shallow=True):
         """
@@ -1749,6 +1924,14 @@ class DataSet(FourcatModule):
         if is_final:
             self.no_status_updates = True
 
+        # status updates double as processing heartbeats for the owning attempt
+        bound_attempt = self._bound_attempt()
+        if bound_attempt is not None and self.data.get("attempt_id") == bound_attempt.id:
+            try:
+                bound_attempt.touch_heartbeat()
+            except Exception:
+                pass
+
         self.log(status)
 
         return updated > 0
@@ -1965,8 +2148,11 @@ class DataSet(FourcatModule):
         if self._children is not None and not update:
             return self._children
 
+        # rows tagged with a non-committed attempt belong to an in-flight
+        # publication (their tags are cleared in the publish transaction);
+        # they must not appear as runnable/visible children beforehand
         analyses = self.db.fetchall(
-            "SELECT * FROM datasets WHERE key_parent = %s ORDER BY timestamp ASC",
+            "SELECT * FROM datasets WHERE key_parent = %s AND attempt_id = '' ORDER BY timestamp ASC",
             (self.key,),
         )
         self._children = [

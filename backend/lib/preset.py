@@ -48,7 +48,7 @@ class ProcessorPreset(BasicProcessor):
 		is finished by the last underlying analysis.
 		"""
 		self.dataset.update_status("Awaiting completion of underlying analyses...")
-		self.job.finish()
+		self.finish_job()
 
 	@abc.abstractmethod
 	def get_processor_pipeline(self):

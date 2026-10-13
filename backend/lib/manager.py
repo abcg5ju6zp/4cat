@@ -9,6 +9,7 @@ from collections.abc import Generator
 
 from backend.lib.proxied_requests import DelegatedRequestHandler
 from backend.lib.worker import BasicWorker
+from common.lib.attempt import Attempt
 from common.lib.exceptions import JobClaimedException
 
 # for now, this is hardcoded - could be dynamic or depending on the queue ID in
@@ -120,9 +121,23 @@ class WorkerManager:
 				# if a job is of a known type, and that job type has open
 				# worker slots, start a new worker to run it
 				if len(self.worker_pool[queue_id]) < MAX_JOBS_PER_QUEUE:
+					# bind a stable attempt identity to this claim; the
+					# attempt row is only kept if the claim actually succeeds
 					try:
-						job.claim()
-						worker = worker_class(logger=self.log, manager=self, job=job, modules=self.modules)
+						attempt = Attempt.create(
+							jobtype=jobtype,
+							remote_id=job.data["remote_id"],
+							database=self.db,
+							modules=self.modules,
+						)
+						try:
+							job.claim(attempt_id=attempt.id)
+						except JobClaimedException:
+							attempt.delete_record()
+							raise
+
+						worker = worker_class(logger=self.log, manager=self, job=job, modules=self.modules,
+											  attempt=attempt)
 						worker.start()
 						log_level = self.log.levels["DEBUG"] if job.data["interval"] else self.log.levels["INFO"]
 						self.log.log(f"Starting new worker for job {job.data['jobtype']}/{job.data['remote_id']}", log_level)
